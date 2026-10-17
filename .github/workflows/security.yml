@@ -27,8 +27,9 @@ on:
       semgrep-block-full-scan:
         description: >-
           Fail full scans (push / schedule / dispatch) on any finding. Pull requests always fail on
-          findings that the PR introduces (baseline = PR base commit), so existing findings in a
-          brownfield repo do not block unrelated work; they are listed in the job summary and SARIF.
+          findings that the PR introduces (baseline = PR base commit) and report only those, so
+          existing findings in a brownfield repo do not block unrelated work. Existing findings
+          appear in the summary and SARIF of full scans (push to main).
         type: boolean
         default: false
       trivy-severity:
@@ -109,12 +110,14 @@ jobs:
             range="$PUSH_BEFORE..$PUSH_AFTER"
           fi
           args=(git --redact --no-banner --exit-code 1 --report-format sarif --report-path "$RUNNER_TEMP/gitleaks.sarif")
+          # --diff-merges=first-parent: also scan what merge commits change, so a secret added
+          # while resolving a conflict is not missed (git log -p skips merge diffs by default).
           if [ -n "$range" ]; then
             echo "Scanning commit range $range"
-            gitleaks "${args[@]}" --log-opts="$range" .
+            gitleaks "${args[@]}" --log-opts="--diff-merges=first-parent $range" .
           else
             echo "Scanning full history"
-            gitleaks "${args[@]}" .
+            gitleaks "${args[@]}" --log-opts="--diff-merges=first-parent --full-history --all" .
           fi
 
       - name: Upload report
@@ -167,8 +170,14 @@ jobs:
           uvx "semgrep@$SEMGREP_VERSION" "${args[@]}" .
           code=$?
           set -e
-          count=$(uv run --no-project python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["results"]))' "$RUNNER_TEMP/semgrep.json" 2>/dev/null || echo "?")
-          echo "### Semgrep: $count finding(s) reported (exit $code)" >> "$GITHUB_STEP_SUMMARY"
+          # -I: isolated mode, so a json.py in the checkout cannot be imported here.
+          read -r count errors < <(uv run --no-project python -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["results"]), len(d["errors"]))' "$RUNNER_TEMP/semgrep.json" 2>/dev/null || echo "? ?")
+          echo "### Semgrep: $count finding(s) reported, $errors analysis error(s) (exit $code)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$errors" != 0 ]; then
+            # Parse errors / timeouts mean some code was not analysed. Not fatal (unrelated files such
+            # as broken YAML would block every PR), but visible on the PR.
+            echo "::warning title=Semgrep incomplete analysis::$errors file(s) or rule(s) were not fully analysed; see the job log and semgrep.json"
+          fi
           exit "$code"
 
       - name: Upload report
@@ -176,7 +185,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: semgrep-sarif
-          path: ${{ runner.temp }}/semgrep.sarif
+          path: |
+            ${{ runner.temp }}/semgrep.sarif
+            ${{ runner.temp }}/semgrep.json
           if-no-files-found: ignore
           retention-days: 14
 
@@ -208,8 +219,14 @@ jobs:
           osv-scanner scan source --recursive --format sarif --output-file "$RUNNER_TEMP/osv.sarif" .
           code=$?
           osv-scanner scan source --recursive --format table . || true
-          # 0 = clean, 1 = vulnerabilities found, 128 = no packages found (nothing to scan).
-          if [ "$code" = 128 ]; then echo "No lockfiles or manifests found."; exit 0; fi
+          # 0 = clean, 1 = vulnerabilities found, 128 = no packages found. 128 is only a pass when the
+          # repository really has no lockfile/manifest; otherwise a file failed to parse (fail closed).
+          if [ "$code" = 128 ]; then
+            manifests=$(git ls-files | grep -E '(^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lock|requirements[^/]*\.txt|uv\.lock|poetry\.lock|Pipfile\.lock|pdm\.lock|go\.mod|Cargo\.lock|Gemfile\.lock|composer\.lock|pom\.xml|gradle\.lockfile|pubspec\.lock|packages\.lock\.json|mix\.lock)$' || true)
+            if [ -z "$manifests" ]; then echo "No lockfiles or manifests in the repository; nothing to scan."; exit 0; fi
+            echo "::error::OSV-Scanner extracted no packages, but these files exist:"; echo "$manifests"
+            exit 1
+          fi
           exit "$code"
 
       - name: Upload report
