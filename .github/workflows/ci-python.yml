@@ -17,9 +17,9 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: JSON runs-on value. '"ubuntu-latest"' for public repos, '["self-hosted","linux","x64","railway"]' for private.
+        description: JSON runs-on value. '"ubuntu-24.04"' (pinned image) for public repos, '["self-hosted","linux","x64","railway"]' for private.
         type: string
-        default: '"ubuntu-latest"'
+        default: '"ubuntu-24.04"'
       working-directory:
         description: Directory that holds pyproject.toml / requirements files.
         type: string
@@ -131,7 +131,7 @@ jobs:
             start-postgres   # Railway runner: PostgreSQL 17, trust auth on 127.0.0.1
           else
             # GitHub-hosted Ubuntu ships PostgreSQL stopped; switch it to trust auth for this throwaway VM.
-            conf=$(ls /etc/postgresql/*/main/pg_hba.conf | head -n1)
+            confs=(/etc/postgresql/*/main/pg_hba.conf); conf="${confs[0]}"
             printf 'local all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\n' | sudo tee "$conf" >/dev/null
             sudo systemctl start postgresql.service
             for _ in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && break; sleep 1; done

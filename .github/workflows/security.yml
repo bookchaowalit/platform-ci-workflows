@@ -17,9 +17,9 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: JSON runs-on value. '"ubuntu-latest"' for public repos, '["self-hosted","linux","x64","railway"]' for private.
+        description: JSON runs-on value. '"ubuntu-24.04"' (pinned image) for public repos, '["self-hosted","linux","x64","railway"]' for private.
         type: string
-        default: '"ubuntu-latest"'
+        default: '"ubuntu-24.04"'
       semgrep-config:
         description: Space-separated Semgrep configs (registry rulesets or repo paths).
         type: string
@@ -145,6 +145,7 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           python-version: "3.13"
+          enable-cache: false
 
       - name: Scan (Semgrep CE ${{ env.SEMGREP_VERSION }})
         env:

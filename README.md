@@ -17,9 +17,11 @@ run on GitHub-hosted runners and on the Railway self-hosted runner.
 
 | Repository | `runner` input | PostgreSQL |
 |---|---|---|
-| Public | `'"ubuntu-latest"'` (default) | `postgres: true` starts the VM's preinstalled server |
+| Public | `'"ubuntu-24.04"'` (default) | `postgres: true` starts the VM's preinstalled server |
 | Private | `'["self-hosted","linux","x64","railway"]'` | `postgres: true` runs `start-postgres` (PostgreSQL 17 baked into the runner image) |
 
+The hosted image is pinned to `ubuntu-24.04` rather than `ubuntu-latest`, which GitHub moves to
+Ubuntu 26 from 2026-10-19; moving to a newer image is a deliberate change here, not a surprise.
 Private repositories never run on the local machine. The runner image and its pitfalls are in
 [`platform-ops-cli/infra/ci-runner`](https://github.com/bookchaowalit/platform-ops-cli/tree/main/infra/ci-runner).
 The Railway runner has no Docker, so `services:` containers, image builds, image scans,
