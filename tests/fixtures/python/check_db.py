@@ -7,7 +7,12 @@ url = os.environ["DATABASE_URL"]
 name = url.rsplit("/", 1)[1]
 assert name.startswith("ci_"), name
 out = subprocess.run(
-    ["psql", url, "-qAtc", "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"],
+    [
+        "psql",
+        url,
+        "-qAtc",
+        "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'",
+    ],
     check=True,
     capture_output=True,
     text=True,
