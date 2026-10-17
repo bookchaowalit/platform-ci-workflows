@@ -1,0 +1,179 @@
+# Reusable Python CI with uv: install, Ruff lint + format check, mypy or pyright, pytest.
+#
+# Caller example (private repo):
+#   jobs:
+#     api:
+#       uses: bookchaowalit/platform-ci-workflows/.github/workflows/ci-python.yml@<sha> # v1.0.0
+#       with:
+#         runner: '["self-hosted","linux","x64","railway"]'
+#         working-directory: services/api
+#         postgres: true
+#
+# Tools the project installs into its own environment (e.g. ruff in its dev extras) are
+# used as-is; otherwise the pinned versions below run through `uvx`.
+name: ci-python
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON runs-on value. '"ubuntu-latest"' for public repos, '["self-hosted","linux","x64","railway"]' for private.
+        type: string
+        default: '"ubuntu-latest"'
+      working-directory:
+        description: Directory that holds pyproject.toml / requirements files.
+        type: string
+        default: "."
+      python-version:
+        type: string
+        default: "3.13"
+      install-command:
+        description: >-
+          "auto": uv.lock -> uv sync --frozen --all-extras; requirements-dev.txt / requirements.txt -> uv pip install -r;
+          pyproject.toml -> uv pip install -e ".[dev]" (falls back to -e .). "" skips.
+        type: string
+        default: auto
+      lint-command:
+        description: '"auto" runs ruff check. "" skips.'
+        type: string
+        default: auto
+      format-check:
+        description: Run `ruff format --check` (only with lint-command auto).
+        type: boolean
+        default: true
+      typecheck-command:
+        description: '"auto" runs mypy when [tool.mypy]/mypy.ini exists, pyright when [tool.pyright]/pyrightconfig.json exists. "" skips.'
+        type: string
+        default: auto
+      test-command:
+        description: '"auto" runs pytest. "" skips.'
+        type: string
+        default: auto
+      postgres:
+        description: Start a disposable PostgreSQL and export DATABASE_URL (start-postgres on Railway, the preinstalled server on GitHub-hosted).
+        type: boolean
+        default: false
+      timeout-minutes:
+        type: number
+        default: 20
+
+permissions:
+  contents: read
+
+env:
+  # renovate: datasource=pypi depName=uv
+  UV_VERSION: "0.13.1"
+  # renovate: datasource=pypi depName=ruff
+  RUFF_VERSION: "0.17.1"
+  # renovate: datasource=pypi depName=mypy
+  MYPY_VERSION: "2.4.0"
+  # renovate: datasource=pypi depName=pyright
+  PYRIGHT_VERSION: "1.1.414"
+  # renovate: datasource=pypi depName=pytest
+  PYTEST_VERSION: "9.1.1"
+
+jobs:
+  python:
+    name: python (${{ inputs.working-directory }})
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ inputs.python-version }}
+          enable-cache: true
+          cache-dependency-glob: |
+            ${{ inputs.working-directory }}/uv.lock
+            ${{ inputs.working-directory }}/requirements*.txt
+            ${{ inputs.working-directory }}/pyproject.toml
+
+      - name: Install dependencies
+        if: inputs.install-command != ''
+        env:
+          CMD: ${{ inputs.install-command }}
+        run: |
+          if [ "$CMD" != auto ]; then
+            [ -d .venv ] || uv venv .venv
+            eval "$CMD"
+          elif [ -f uv.lock ]; then
+            uv sync --frozen --all-extras
+          else
+            uv venv .venv
+            if [ -f requirements-dev.txt ] || [ -f requirements.txt ]; then
+              for f in requirements.txt requirements-dev.txt; do
+                if [ -f "$f" ]; then uv pip install -r "$f"; fi
+              done
+            elif [ -f pyproject.toml ]; then
+              uv pip install -e ".[dev]" || uv pip install -e .
+            fi
+          fi
+          if [ -d .venv ]; then
+            echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+            echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Start PostgreSQL
+        if: inputs.postgres
+        working-directory: .
+        run: |
+          if command -v start-postgres >/dev/null 2>&1; then
+            start-postgres   # Railway runner: PostgreSQL 17, trust auth on 127.0.0.1
+          else
+            # GitHub-hosted Ubuntu ships PostgreSQL stopped; switch it to trust auth for this throwaway VM.
+            conf=$(ls /etc/postgresql/*/main/pg_hba.conf | head -n1)
+            printf 'local all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\n' | sudo tee "$conf" >/dev/null
+            sudo systemctl start postgresql.service
+            for _ in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && break; sleep 1; done
+            pg_isready -h 127.0.0.1 -p 5432 -U postgres
+          fi
+          echo "DATABASE_URL=postgresql://postgres@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
+
+      - name: Lint (Ruff)
+        if: inputs.lint-command != ''
+        env:
+          CMD: ${{ inputs.lint-command }}
+          FORMAT_CHECK: ${{ inputs.format-check }}
+        run: |
+          if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
+          if command -v ruff >/dev/null 2>&1; then ruff=(ruff); else ruff=(uvx "ruff@$RUFF_VERSION"); fi
+          "${ruff[@]}" check --output-format=github .
+          if [ "$FORMAT_CHECK" = true ]; then "${ruff[@]}" format --check .; fi
+
+      - name: Typecheck
+        if: inputs.typecheck-command != ''
+        env:
+          CMD: ${{ inputs.typecheck-command }}
+        run: |
+          if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
+          has() { [ -f pyproject.toml ] && grep -q "^\[tool\.$1\]" pyproject.toml; }
+          if has mypy || [ -f mypy.ini ] || [ -f .mypy.ini ]; then
+            if command -v mypy >/dev/null 2>&1; then mypy .; else uvx "mypy@$MYPY_VERSION" .; fi
+          elif has pyright || [ -f pyrightconfig.json ]; then
+            if command -v pyright >/dev/null 2>&1; then pyright; else uvx "pyright@$PYRIGHT_VERSION"; fi
+          else
+            echo "::warning::No [tool.mypy] or [tool.pyright] config; typecheck skipped."
+          fi
+
+      - name: Test
+        if: inputs.test-command != ''
+        env:
+          CMD: ${{ inputs.test-command }}
+        run: |
+          if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
+          if python -c 'import pytest' >/dev/null 2>&1; then
+            python -m pytest -q
+          else
+            uv pip install "pytest==$PYTEST_VERSION"
+            python -m pytest -q
+          fi

@@ -1,0 +1,272 @@
+# Reusable security scans, all run as pinned binaries (no Docker, so they work on the
+# Railway self-hosted runner too):
+#   - Gitleaks     secrets in git history (PR range / pushed range / full history)
+#   - Semgrep CE   SAST with registry rulesets, metrics off
+#   - OSV-Scanner  known vulnerabilities in lockfiles / manifests
+#   - Trivy fs     vulnerabilities + IaC misconfiguration (Dockerfile, Terraform, k8s) in the checkout
+# Container image scans are out of scope until a Docker-capable runner exists (ADR).
+#
+# Each binary download is checked against a SHA-256 pinned below. When bumping a version,
+# update the checksum with scripts/tool-checksums.sh.
+#
+# Repo-level tuning files are picked up automatically:
+#   .gitleaks.toml / .gitleaksignore, .semgrepignore, osv-scanner.toml, .trivyignore(.yaml)
+name: security
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON runs-on value. '"ubuntu-latest"' for public repos, '["self-hosted","linux","x64","railway"]' for private.
+        type: string
+        default: '"ubuntu-latest"'
+      semgrep-config:
+        description: Space-separated Semgrep configs (registry rulesets or repo paths).
+        type: string
+        default: "p/default"
+      semgrep-block-full-scan:
+        description: >-
+          Fail full scans (push / schedule / dispatch) on any finding. Pull requests always fail on
+          findings that the PR introduces (baseline = PR base commit), so existing findings in a
+          brownfield repo do not block unrelated work; they are listed in the job summary and SARIF.
+        type: boolean
+        default: false
+      trivy-severity:
+        description: Severities that fail the Trivy job.
+        type: string
+        default: "HIGH,CRITICAL"
+      trivy-scanners:
+        type: string
+        default: "vuln,misconfig"
+      gitleaks:
+        type: boolean
+        default: true
+      semgrep:
+        type: boolean
+        default: true
+      osv-scanner:
+        type: boolean
+        default: true
+      trivy:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  # renovate: datasource=github-releases depName=gitleaks/gitleaks
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"  # gitleaks_8.30.1_linux_x64.tar.gz
+  # renovate: datasource=github-releases depName=google/osv-scanner
+  OSV_SCANNER_VERSION: "2.7.0"
+  OSV_SCANNER_SHA256: "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b"  # osv-scanner_linux_amd64
+  # renovate: datasource=github-releases depName=aquasecurity/trivy
+  TRIVY_VERSION: "0.76.0"
+  TRIVY_SHA256: "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7"  # trivy_0.76.0_Linux-64bit.tar.gz
+  # renovate: datasource=pypi depName=semgrep
+  SEMGREP_VERSION: "1.181.0"
+  # renovate: datasource=pypi depName=uv
+  UV_VERSION: "0.13.1"
+
+jobs:
+  gitleaks:
+    if: inputs.gitleaks
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Gitleaks ${{ env.GITLEAKS_VERSION }}
+        run: |
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"; cd "$RUNNER_TEMP"
+          f="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$f" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$f"
+          echo "$GITLEAKS_SHA256  $f" | sha256sum -c -
+          tar -xzf "$f" -C "$bin" gitleaks
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Scan
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          range=""
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = pull_request_target ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ "$EVENT" = push ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ] \
+               && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            range="$PUSH_BEFORE..$PUSH_AFTER"
+          fi
+          args=(git --redact --no-banner --exit-code 1 --report-format sarif --report-path "$RUNNER_TEMP/gitleaks.sarif")
+          if [ -n "$range" ]; then
+            echo "Scanning commit range $range"
+            gitleaks "${args[@]}" --log-opts="$range" .
+          else
+            echo "Scanning full history"
+            gitleaks "${args[@]}" .
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gitleaks-sarif
+          path: ${{ runner.temp }}/gitleaks.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+  semgrep:
+    if: inputs.semgrep
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (full history for the PR baseline)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+
+      - name: Scan (Semgrep CE ${{ env.SEMGREP_VERSION }})
+        env:
+          CONFIGS: ${{ inputs.semgrep-config }}
+          SEMGREP_SEND_METRICS: "off"
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BLOCK_FULL: ${{ inputs.semgrep-block-full-scan }}
+        run: |
+          args=(scan --metrics=off --sarif-output="$RUNNER_TEMP/semgrep.sarif" --json-output="$RUNNER_TEMP/semgrep.json" --text)
+          for c in $CONFIGS; do args+=(--config "$c"); done
+          if [ "$EVENT" = pull_request ] && [ -n "$PR_BASE" ]; then
+            echo "Pull request: failing only on findings new since $PR_BASE"
+            args+=(--baseline-commit "$PR_BASE" --error)
+          elif [ "$BLOCK_FULL" = true ]; then
+            args+=(--error)
+          fi
+          set +e
+          uvx "semgrep@$SEMGREP_VERSION" "${args[@]}" .
+          code=$?
+          set -e
+          count=$(uv run --no-project python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["results"]))' "$RUNNER_TEMP/semgrep.json" 2>/dev/null || echo "?")
+          echo "### Semgrep: $count finding(s) reported (exit $code)" >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep-sarif
+          path: ${{ runner.temp }}/semgrep.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+  osv-scanner:
+    if: inputs.osv-scanner
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install OSV-Scanner ${{ env.OSV_SCANNER_VERSION }}
+        run: |
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          curl -fsSL -o "$bin/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "$OSV_SCANNER_SHA256  $bin/osv-scanner" | sha256sum -c -
+          chmod +x "$bin/osv-scanner"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Scan
+        run: |
+          set +e
+          osv-scanner scan source --recursive --format sarif --output-file "$RUNNER_TEMP/osv.sarif" .
+          code=$?
+          osv-scanner scan source --recursive --format table . || true
+          # 0 = clean, 1 = vulnerabilities found, 128 = no packages found (nothing to scan).
+          if [ "$code" = 128 ]; then echo "No lockfiles or manifests found."; exit 0; fi
+          exit "$code"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: osv-sarif
+          path: ${{ runner.temp }}/osv.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+  trivy-fs:
+    if: inputs.trivy
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy ${{ env.TRIVY_VERSION }}
+        run: |
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"; cd "$RUNNER_TEMP"
+          f="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL -o "$f" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/$f"
+          echo "$TRIVY_SHA256  $f" | sha256sum -c -
+          tar -xzf "$f" -C "$bin" trivy
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Cache vulnerability DB
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: trivy-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: trivy-db-${{ runner.os }}-
+
+      - name: Scan filesystem
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+          SEVERITY: ${{ inputs.trivy-severity }}
+          SCANNERS: ${{ inputs.trivy-scanners }}
+        run: |
+          common=(fs --scanners "$SCANNERS" --severity "$SEVERITY" --ignore-unfixed --skip-dirs node_modules --skip-dirs .venv)
+          # .trivyignore is read by default; the YAML form (with paths and statements) must be named.
+          if [ -f .trivyignore.yaml ]; then common+=(--ignorefile .trivyignore.yaml); fi
+          common+=(.)
+          trivy "${common[@]}" --format sarif --output "$RUNNER_TEMP/trivy.sarif"
+          trivy "${common[@]}" --skip-db-update --format table --exit-code 1
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trivy-sarif
+          path: ${{ runner.temp }}/trivy.sarif
+          if-no-files-found: ignore
+          retention-days: 14

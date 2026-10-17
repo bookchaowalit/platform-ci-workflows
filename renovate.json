@@ -1,0 +1,35 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommitTypeAll(chore)"
+  ],
+  "timezone": "Asia/Bangkok",
+  "schedule": ["before 9am on monday"],
+  "labels": ["dependencies"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tool versions pinned in workflow env blocks (# renovate: datasource=... depName=...)",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+_VERSION: \"(?<currentValue>[^\"]+)\""
+      ],
+      "extractVersionTemplate": "^v?(?<version>.+)$"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Security binaries are checksum-pinned: a bump fails CI until scripts/tool-checksums.sh output is pasted in. Never automerge.",
+      "matchDepNames": ["gitleaks/gitleaks", "google/osv-scanner", "aquasecurity/trivy", "rhysd/actionlint"],
+      "automerge": false,
+      "prBodyNotes": ["Run `scripts/tool-checksums.sh` and update the matching `*_SHA256` value in this PR before merging."]
+    },
+    {
+      "description": "Group the action digest updates into one weekly PR",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    }
+  ]
+}

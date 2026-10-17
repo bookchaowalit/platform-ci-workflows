@@ -1,0 +1,173 @@
+# Reusable Node.js CI: install, lint (Biome or ESLint), typecheck, Vitest/test, optional build.
+#
+# Caller example (public repo):
+#   jobs:
+#     web:
+#       uses: bookchaowalit/platform-ci-workflows/.github/workflows/ci-node.yml@<sha> # v1.0.0
+#       with:
+#         working-directory: apps/web
+#
+# Private repos pass runner: '["self-hosted","linux","x64","railway"]'.
+name: ci-node
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON runs-on value. '"ubuntu-latest"' for public repos, '["self-hosted","linux","x64","railway"]' for private.
+        type: string
+        default: '"ubuntu-latest"'
+      working-directory:
+        description: Directory that holds package.json.
+        type: string
+        default: "."
+      node-version:
+        description: Node.js version. Ignored when node-version-file is set.
+        type: string
+        default: "22"
+      node-version-file:
+        description: File with the Node.js version (.nvmrc, .node-version, package.json), relative to the repo root.
+        type: string
+        default: ""
+      lint-command:
+        description: Lint command. "auto" runs `biome ci` when biome.json(c) exists, else the `lint` script if present. "" skips.
+        type: string
+        default: auto
+      typecheck-command:
+        description: Typecheck command. "auto" runs the `typecheck` script, else `tsc --noEmit` when tsconfig.json exists. "" skips.
+        type: string
+        default: auto
+      test-command:
+        description: Test command. "auto" runs the `test` script when present. "" skips.
+        type: string
+        default: auto
+      build-command:
+        description: Optional build command, e.g. "npm run build". "" skips.
+        type: string
+        default: ""
+      postgres:
+        description: Start a disposable PostgreSQL and export DATABASE_URL (start-postgres on Railway, the preinstalled server on GitHub-hosted).
+        type: boolean
+        default: false
+      timeout-minutes:
+        type: number
+        default: 20
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: node (${{ inputs.working-directory }})
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect package manager
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+            echo "lockfile=pnpm-lock.yaml" >> "$GITHUB_OUTPUT"
+          elif [ -f package-lock.json ]; then
+            echo "manager=npm" >> "$GITHUB_OUTPUT"
+            echo "lockfile=package-lock.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No package-lock.json or pnpm-lock.yaml in ${{ inputs.working-directory }}; commit a lockfile so installs are reproducible."
+            exit 1
+          fi
+
+      - name: Set up pnpm
+        if: steps.pm.outputs.manager == 'pnpm'
+        uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: ${{ steps.pm.outputs.manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ steps.pm.outputs.lockfile }}
+
+      - name: Install dependencies
+        run: |
+          if [ "${{ steps.pm.outputs.manager }}" = pnpm ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Start PostgreSQL
+        if: inputs.postgres
+        working-directory: .
+        run: |
+          if command -v start-postgres >/dev/null 2>&1; then
+            start-postgres   # Railway runner: PostgreSQL 17, trust auth on 127.0.0.1
+          else
+            # GitHub-hosted Ubuntu ships PostgreSQL stopped; switch it to trust auth for this throwaway VM.
+            conf=$(ls /etc/postgresql/*/main/pg_hba.conf | head -n1)
+            printf 'local all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\n' | sudo tee "$conf" >/dev/null
+            sudo systemctl start postgresql.service
+            for _ in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && break; sleep 1; done
+            pg_isready -h 127.0.0.1 -p 5432 -U postgres
+          fi
+          echo "DATABASE_URL=postgresql://postgres@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
+
+      - name: Lint
+        if: inputs.lint-command != ''
+        env:
+          CMD: ${{ inputs.lint-command }}
+          PM: ${{ steps.pm.outputs.manager }}
+        run: |
+          if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
+          if [ -f biome.json ] || [ -f biome.jsonc ]; then
+            "$PM" exec biome ci .
+          elif node -e 'process.exit(require("./package.json").scripts?.lint ? 0 : 1)'; then
+            "$PM" run lint
+          else
+            echo "::warning::No Biome config or lint script; lint skipped."
+          fi
+
+      - name: Typecheck
+        if: inputs.typecheck-command != ''
+        env:
+          CMD: ${{ inputs.typecheck-command }}
+          PM: ${{ steps.pm.outputs.manager }}
+        run: |
+          if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
+          if node -e 'process.exit(require("./package.json").scripts?.typecheck ? 0 : 1)'; then
+            "$PM" run typecheck
+          elif [ -f tsconfig.json ]; then
+            "$PM" exec tsc --noEmit
+          else
+            echo "No typecheck script or tsconfig.json; typecheck skipped."
+          fi
+
+      - name: Test
+        if: inputs.test-command != ''
+        env:
+          CMD: ${{ inputs.test-command }}
+          PM: ${{ steps.pm.outputs.manager }}
+        run: |
+          if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
+          if node -e 'process.exit(require("./package.json").scripts?.test ? 0 : 1)'; then
+            "$PM" run test
+          else
+            echo "::warning::No test script; tests skipped."
+          fi
+
+      - name: Build
+        if: inputs.build-command != ''
+        env:
+          CMD: ${{ inputs.build-command }}
+        run: eval "$CMD"
