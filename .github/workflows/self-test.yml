@@ -36,5 +36,15 @@ jobs:
       - name: shellcheck scripts
         run: shellcheck scripts/*.sh
 
+  python-postgres:
+    # Exercises ci-python + postgres on a GitHub-hosted runner (the pilots cover Railway).
+    uses: ./.github/workflows/ci-python.yml
+    with:
+      working-directory: tests/fixtures/python
+      install-command: ""
+      typecheck-command: ""
+      test-command: python check_db.py
+      postgres: true
+
   security:
     uses: ./.github/workflows/security.yml

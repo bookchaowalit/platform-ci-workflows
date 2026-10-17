@@ -27,8 +27,10 @@ Private repositories never run on the local machine. The runner image and its pi
 The Railway runner has no Docker, so `services:` containers, image builds, image scans,
 Testcontainers and ZAP are deferred to a later phase (see the ADR in `architecture-docs`).
 
-With `postgres: true`, `DATABASE_URL=postgresql://postgres@127.0.0.1:5432/postgres` is
-exported. Map it to the name your tests read inside `test-command`, for example
+With `postgres: true`, every job gets a fresh database `ci_<run>_<attempt>_<n>` and
+`DATABASE_URL=postgresql://postgres@127.0.0.1:5432/<that database>` is exported. The database is
+dropped when the job ends, and leftovers from cancelled runs are dropped at the next start (the
+Railway runner and its PostgreSQL persist between jobs). Map it to the name your tests read inside `test-command`, for example
 `CRM_TEST_DATABASE_URL="$DATABASE_URL" python -m unittest`.
 
 ## Usage
@@ -70,6 +72,7 @@ on it rather than running in parallel.
 Each step's command input defaults to `auto`, which detects the tool from the files in
 `working-directory`; pass a command to override it, or `""` to skip the step.
 
+- **pnpm**: the version comes from `packageManager` in `package.json`, or the `pnpm-version` input.
 - **Node lint**: `biome ci .` when `biome.json(c)` exists, else the `lint` script, else skipped with a warning.
 - **Node typecheck**: the `typecheck` script, else `tsc --noEmit` when `tsconfig.json` exists.
 - **Python install**: `uv sync --frozen --all-extras` with `uv.lock`; else `uv pip install -r` for
@@ -86,9 +89,9 @@ A tool installed in the project's own environment wins over the pinned default, 
 
 | Scanner | Fails when | Scope |
 |---|---|---|
-| Gitleaks | any secret | PR: the PR's commits. Push: the pushed range. Otherwise: full history |
-| Semgrep CE (`p/default`) | PR: a finding the PR introduces. Full scans: report only (`semgrep-block-full-scan: true` to fail) | whole checkout |
-| OSV-Scanner | any known vulnerability | every lockfile / manifest |
+| Gitleaks | any secret | PR: the PR's commits. Push: the pushed range. Otherwise: full history. Merge-commit diffs included |
+| Semgrep CE (`p/default`) | PR: a finding the PR introduces (only new findings are reported). Full scans on `main`: every finding reported, not failing unless `semgrep-block-full-scan: true`. Parse errors/timeouts raise a warning | whole checkout |
+| OSV-Scanner | any known vulnerability, or a lockfile it could not parse | every lockfile / manifest |
 | Trivy fs | fixable `HIGH`/`CRITICAL` vuln or misconfiguration | whole checkout, minus `node_modules` and `.venv` |
 
 Every scanner uploads its SARIF report as a workflow artifact (14 days). Code-scanning upload is

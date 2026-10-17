@@ -137,7 +137,16 @@ jobs:
             for _ in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && break; sleep 1; done
             pg_isready -h 127.0.0.1 -p 5432 -U postgres
           fi
-          echo "DATABASE_URL=postgresql://postgres@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
+          # The Railway runner (and its PostgreSQL) persists between jobs: give every job a fresh
+          # database and drop leftovers from cancelled runs. A repo-scoped runner runs one job at a time.
+          psql=(psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -qAt)
+          for old in $("${psql[@]}" -c "SELECT datname FROM pg_database WHERE datname LIKE 'ci\_%'"); do
+            "${psql[@]}" -c "DROP DATABASE IF EXISTS \"$old\" WITH (FORCE)"
+          done
+          db="ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${RANDOM}"
+          "${psql[@]}" -c "CREATE DATABASE \"$db\""
+          echo "CI_DATABASE=$db" >> "$GITHUB_ENV"
+          echo "DATABASE_URL=postgresql://postgres@127.0.0.1:5432/$db" >> "$GITHUB_ENV"
 
       - name: Lint (Ruff)
         if: inputs.lint-command != ''
@@ -158,9 +167,12 @@ jobs:
           if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
           has() { [ -f pyproject.toml ] && grep -q "^\[tool\.$1\]" pyproject.toml; }
           if has mypy || [ -f mypy.ini ] || [ -f .mypy.ini ]; then
-            if command -v mypy >/dev/null 2>&1; then mypy .; else uvx "mypy@$MYPY_VERSION" .; fi
+            # Run inside the project environment so installed dependencies, stubs and plugins are visible.
+            command -v mypy >/dev/null 2>&1 || uv pip install "mypy==$MYPY_VERSION"
+            mypy .
           elif has pyright || [ -f pyrightconfig.json ]; then
-            if command -v pyright >/dev/null 2>&1; then pyright; else uvx "pyright@$PYRIGHT_VERSION"; fi
+            command -v pyright >/dev/null 2>&1 || uv pip install "pyright==$PYRIGHT_VERSION"
+            pyright --pythonpath "$(command -v python)"
           else
             echo "::warning::No [tool.mypy] or [tool.pyright] config; typecheck skipped."
           fi
@@ -177,3 +189,8 @@ jobs:
             uv pip install "pytest==$PYTEST_VERSION"
             python -m pytest -q
           fi
+
+      - name: Drop CI database
+        if: always() && inputs.postgres && env.CI_DATABASE != ''
+        working-directory: .
+        run: psql -h 127.0.0.1 -U postgres -d postgres -qAt -c "DROP DATABASE IF EXISTS \"$CI_DATABASE\" WITH (FORCE)" || true

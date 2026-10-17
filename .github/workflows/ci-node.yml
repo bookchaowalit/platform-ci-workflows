@@ -25,6 +25,10 @@ on:
         description: Node.js version. Ignored when node-version-file is set.
         type: string
         default: "22"
+      pnpm-version:
+        description: pnpm version when package.json has no packageManager field (e.g. "10.20.0").
+        type: string
+        default: ""
       node-version-file:
         description: File with the Node.js version (.nvmrc, .node-version, package.json), relative to the repo root.
         type: string
@@ -73,6 +77,8 @@ jobs:
 
       - name: Detect package manager
         id: pm
+        env:
+          DIR: ${{ inputs.working-directory }}
         run: |
           if [ -f pnpm-lock.yaml ]; then
             echo "manager=pnpm" >> "$GITHUB_OUTPUT"
@@ -81,7 +87,7 @@ jobs:
             echo "manager=npm" >> "$GITHUB_OUTPUT"
             echo "lockfile=package-lock.json" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::No package-lock.json or pnpm-lock.yaml in ${{ inputs.working-directory }}; commit a lockfile so installs are reproducible."
+            echo "::error::No package-lock.json or pnpm-lock.yaml in $DIR; commit a lockfile so installs are reproducible."
             exit 1
           fi
 
@@ -89,6 +95,7 @@ jobs:
         if: steps.pm.outputs.manager == 'pnpm'
         uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
         with:
+          version: ${{ inputs.pnpm-version }}
           package_json_file: ${{ inputs.working-directory }}/package.json
 
       - name: Set up Node.js
@@ -121,7 +128,16 @@ jobs:
             for _ in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && break; sleep 1; done
             pg_isready -h 127.0.0.1 -p 5432 -U postgres
           fi
-          echo "DATABASE_URL=postgresql://postgres@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
+          # The Railway runner (and its PostgreSQL) persists between jobs: give every job a fresh
+          # database and drop leftovers from cancelled runs. A repo-scoped runner runs one job at a time.
+          psql=(psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -qAt)
+          for old in $("${psql[@]}" -c "SELECT datname FROM pg_database WHERE datname LIKE 'ci\_%'"); do
+            "${psql[@]}" -c "DROP DATABASE IF EXISTS \"$old\" WITH (FORCE)"
+          done
+          db="ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${RANDOM}"
+          "${psql[@]}" -c "CREATE DATABASE \"$db\""
+          echo "CI_DATABASE=$db" >> "$GITHUB_ENV"
+          echo "DATABASE_URL=postgresql://postgres@127.0.0.1:5432/$db" >> "$GITHUB_ENV"
 
       - name: Lint
         if: inputs.lint-command != ''
@@ -171,3 +187,8 @@ jobs:
         env:
           CMD: ${{ inputs.build-command }}
         run: eval "$CMD"
+
+      - name: Drop CI database
+        if: always() && inputs.postgres && env.CI_DATABASE != ''
+        working-directory: .
+        run: psql -h 127.0.0.1 -U postgres -d postgres -qAt -c "DROP DATABASE IF EXISTS \"$CI_DATABASE\" WITH (FORCE)" || true
