@@ -1,4 +1,4 @@
-# Reusable Node.js CI: install, lint (Biome or ESLint), typecheck, Vitest/test, optional build.
+# Reusable Node.js CI: install, lint (Biome or ESLint), typecheck, Vitest/test, optional coverage gate, optional build.
 #
 # Caller example (public repo):
 #   jobs:
@@ -45,6 +45,17 @@ on:
         description: Test command. "auto" runs the `test` script when present. "" skips.
         type: string
         default: auto
+      require-tests:
+        description: With test-command auto, fail (instead of warn) when package.json has no `test` script. Part of the TDD standard.
+        type: boolean
+        default: false
+      coverage-threshold:
+        description: >-
+          Minimum line coverage in percent, e.g. "80". "" turns the gate off. With test-command auto,
+          `vitest run` or `jest` runs with coverage and writes coverage/coverage-summary.json;
+          a custom test-command must write that file itself.
+        type: string
+        default: ""
       build-command:
         description: Optional build command, e.g. "npm run build". "" skips.
         type: string
@@ -164,7 +175,8 @@ jobs:
           if node -e 'process.exit(require("./package.json").scripts?.typecheck ? 0 : 1)'; then
             "$PM" run typecheck
           elif [ -f tsconfig.json ]; then
-            "$PM" exec tsc --noEmit
+            # npm needs `--`, or it reads --noEmit as its own config flag and drops it.
+            if [ "$PM" = npm ]; then npm exec -- tsc --noEmit; else pnpm exec tsc --noEmit; fi
           else
             echo "No typecheck script or tsconfig.json; typecheck skipped."
           fi
@@ -174,13 +186,64 @@ jobs:
         env:
           CMD: ${{ inputs.test-command }}
           PM: ${{ steps.pm.outputs.manager }}
+          REQUIRE_TESTS: ${{ inputs.require-tests }}
+          THRESHOLD: ${{ inputs.coverage-threshold }}
         run: |
           if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
-          if node -e 'process.exit(require("./package.json").scripts?.test ? 0 : 1)'; then
+          run_bin() { if [ "$PM" = npm ]; then npm exec -- "$@"; else pnpm exec "$@"; fi; }  # npm eats flags without `--`
+          has_dep() { node -e 'const p=require("./package.json"); process.exit({...p.dependencies, ...p.devDependencies}[process.argv[1]] ? 0 : 1)' "$1"; }
+          if [ -n "$THRESHOLD" ]; then
+            # Coverage needs a known runner: call it directly rather than through the `test` script.
+            if has_dep vitest; then
+              run_bin vitest run --coverage.enabled=true --coverage.reporter=text \
+                --coverage.reporter=json-summary --coverage.reportsDirectory=coverage
+            elif has_dep jest; then
+              run_bin jest --coverage --coverageReporters=text --coverageReporters=json-summary --coverageDirectory=coverage
+            else
+              echo "::error::coverage-threshold needs vitest or jest in package.json, or a custom test-command that writes coverage/coverage-summary.json."
+              exit 1
+            fi
+          elif node -e 'process.exit(require("./package.json").scripts?.test ? 0 : 1)'; then
             "$PM" run test
+          elif [ "$REQUIRE_TESTS" = true ]; then
+            echo "::error::require-tests is on but package.json has no test script."
+            exit 1
           else
             echo "::warning::No test script; tests skipped."
           fi
+
+      - name: Coverage gate
+        if: inputs.coverage-threshold != ''
+        env:
+          THRESHOLD: ${{ inputs.coverage-threshold }}
+        run: |
+          if ! [[ "$THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v t="$THRESHOLD" 'BEGIN { exit !(t <= 100) }'; then
+            echo "::error::coverage-threshold must be a number from 0 to 100, got \"$THRESHOLD\"."
+            exit 1
+          fi
+          node - <<'EOF'
+          const fs = require("fs");
+          const file = "coverage/coverage-summary.json";
+          const threshold = Number(process.env.THRESHOLD);
+          if (!fs.existsSync(file)) {
+            console.log(`::error::${file} not found. Tests must run with a json-summary coverage reporter.`);
+            process.exit(1);
+          }
+          const { total } = JSON.parse(fs.readFileSync(file, "utf8"));
+          if (!total.lines.total) {
+            console.log("::error::Coverage measured no lines; check the coverage include/exclude settings.");
+            process.exit(1);
+          }
+          const rows = ["lines", "statements", "functions", "branches"]
+            .map((k) => `| ${k} | ${total[k].covered}/${total[k].total} | ${total[k].pct}% |`);
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+            `### Coverage (gate: lines >= ${threshold}%)\n\n| Metric | Covered | % |\n|---|---|---|\n${rows.join("\n")}\n\n`);
+          if (total.lines.pct < threshold) {
+            console.log(`::error::Line coverage ${total.lines.pct}% is below the ${threshold}% threshold.`);
+            process.exit(1);
+          }
+          console.log(`Line coverage ${total.lines.pct}% meets the ${threshold}% threshold.`);
+          EOF
 
       - name: Build
         if: inputs.build-command != ''

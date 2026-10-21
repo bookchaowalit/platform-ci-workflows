@@ -6,8 +6,8 @@ get no CI/CD.
 
 | Workflow | Does |
 |---|---|
-| [`ci-node.yml`](.github/workflows/ci-node.yml) | npm/pnpm install (lockfile required), Biome or ESLint, typecheck, Vitest / `test` script, optional build |
-| [`ci-python.yml`](.github/workflows/ci-python.yml) | uv install, Ruff lint + format check, mypy or pyright, pytest (or a custom test command) |
+| [`ci-node.yml`](.github/workflows/ci-node.yml) | npm/pnpm install (lockfile required), Biome or ESLint, typecheck, Vitest / `test` script, optional coverage gate, optional build |
+| [`ci-python.yml`](.github/workflows/ci-python.yml) | uv install, Ruff lint + format check, mypy or pyright, pytest (or a custom test command), optional coverage gate |
 | [`security.yml`](.github/workflows/security.yml) | Gitleaks, Semgrep CE, OSV-Scanner, Trivy fs (vuln + IaC misconfig) |
 
 Everything runs as pinned binaries or pinned packages, without Docker, so the same workflows
@@ -84,6 +84,21 @@ Each step's command input defaults to `auto`, which detects the tool from the fi
 - **Python tests**: `python -m pytest -q`.
 
 A tool installed in the project's own environment wins over the pinned default, so a repository can pin its own Ruff.
+
+### Tests and coverage gate (TDD standard)
+
+Both gates are **off by default**, so existing callers do not change. Turn them on per repository
+as it adopts the TDD + SDD standard (ADR-0004 in `architecture-docs`).
+
+| Input | Workflow | Effect |
+|---|---|---|
+| `require-tests: true` | `ci-node` | With `test-command: auto`, a missing `test` script fails the job instead of warning. (pytest already fails when it collects no tests.) |
+| `coverage-threshold: "80"` | `ci-node` | Runs `vitest run` (needs `@vitest/coverage-v8` or `-istanbul`) or `jest` directly with coverage and fails when **line** coverage is below the threshold. A custom `test-command` must write `coverage/coverage-summary.json` (json-summary reporter) itself |
+| `coverage-threshold: "80"` | `ci-python` | Runs `pytest --cov` (installs pinned `pytest-cov` if missing) and fails when **total** coverage is below the threshold (`coverage report --fail-under`). Set `[tool.coverage.run] source` so only your code is measured. A custom `test-command` must leave `.coverage` data itself |
+
+The threshold is a number from 0 to 100. Each run writes a coverage table to the job summary.
+Choose the starting threshold just below the repository's current coverage, then raise it; never
+lower it without a recorded exception.
 
 ### Security policy
 

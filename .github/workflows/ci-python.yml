@@ -1,4 +1,4 @@
-# Reusable Python CI with uv: install, Ruff lint + format check, mypy or pyright, pytest.
+# Reusable Python CI with uv: install, Ruff lint + format check, mypy or pyright, pytest, optional coverage gate.
 #
 # Caller example (private repo):
 #   jobs:
@@ -49,6 +49,13 @@ on:
         description: '"auto" runs pytest. "" skips.'
         type: string
         default: auto
+      coverage-threshold:
+        description: >-
+          Minimum total coverage in percent, e.g. "80". "" turns the gate off. With test-command auto,
+          pytest runs under pytest-cov (`--cov`); set `[tool.coverage.run] source` to choose what is measured.
+          A custom test-command must leave coverage.py data (.coverage) itself.
+        type: string
+        default: ""
       postgres:
         description: Start a disposable PostgreSQL and export DATABASE_URL (start-postgres on Railway, the preinstalled server on GitHub-hosted).
         type: boolean
@@ -71,6 +78,8 @@ env:
   PYRIGHT_VERSION: "1.1.414"
   # renovate: datasource=pypi depName=pytest
   PYTEST_VERSION: "9.1.1"
+  # renovate: datasource=pypi depName=pytest-cov
+  PYTEST_COV_VERSION: "7.1.0"
 
 jobs:
   python:
@@ -181,13 +190,31 @@ jobs:
         if: inputs.test-command != ''
         env:
           CMD: ${{ inputs.test-command }}
+          THRESHOLD: ${{ inputs.coverage-threshold }}
         run: |
           if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
-          if python -c 'import pytest' >/dev/null 2>&1; then
-            python -m pytest -q
+          python -c 'import pytest' >/dev/null 2>&1 || uv pip install "pytest==$PYTEST_VERSION"
+          if [ -n "$THRESHOLD" ]; then
+            python -c 'import pytest_cov' >/dev/null 2>&1 || uv pip install "pytest-cov==$PYTEST_COV_VERSION"
+            python -m pytest -q --cov --cov-report=
           else
-            uv pip install "pytest==$PYTEST_VERSION"
             python -m pytest -q
+          fi
+
+      - name: Coverage gate
+        if: inputs.coverage-threshold != ''
+        env:
+          THRESHOLD: ${{ inputs.coverage-threshold }}
+        run: |
+          if ! [[ "$THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v t="$THRESHOLD" 'BEGIN { exit !(t <= 100) }'; then
+            echo "::error::coverage-threshold must be a number from 0 to 100, got \"$THRESHOLD\"."
+            exit 1
+          fi
+          python -c 'import coverage' >/dev/null 2>&1 || uv pip install "pytest-cov==$PYTEST_COV_VERSION"
+          { echo "### Coverage (gate: total >= ${THRESHOLD}%)"; echo; python -m coverage report --format=markdown; echo; } >> "$GITHUB_STEP_SUMMARY" || true
+          if ! python -m coverage report --show-missing --fail-under="$THRESHOLD"; then
+            echo "::error::Total coverage is below the ${THRESHOLD}% threshold, or no coverage data was found (.coverage)."
+            exit 1
           fi
 
       - name: Drop CI database

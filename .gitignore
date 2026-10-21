@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+.coverage
+.coverage.*
+__pycache__/
+.pytest_cache/
+.venv/
