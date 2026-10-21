@@ -214,9 +214,16 @@ jobs:
           fi
           python -c 'import coverage' >/dev/null 2>&1 || uv pip install "pytest-cov==$PYTEST_COV_VERSION"
           { echo "### Coverage (gate: total >= ${THRESHOLD}%)"; echo; python -m coverage report --format=markdown; echo; } >> "$GITHUB_STEP_SUMMARY" || true
-          if ! python -m coverage report --show-missing --fail-under="$THRESHOLD"; then
+          # --precision=2: coverage.py rounds the total to `precision` (default 0) before comparing,
+          # so without it 79.5% would pass an 80% threshold.
+          if ! python -m coverage report --show-missing --precision=2 --fail-under="$THRESHOLD"; then
             echo "::error::Total coverage is below the ${THRESHOLD}% threshold, or no coverage data was found (.coverage)."
             exit 1
+          fi
+          # Ratchet reminder (needs coverage.py >= 7: --format=total).
+          if total=$(python -m coverage report --format=total --precision=2 --fail-under=0 2>/dev/null) \
+            && awk -v c="$total" -v t="$THRESHOLD" 'BEGIN { exit !(c >= t + 2) }'; then
+            echo "::notice::Total coverage ${total}% is 2+ points above the threshold; raise coverage-threshold to ${total%.*} (ratchet)."
           fi
 
       - name: Drop CI database

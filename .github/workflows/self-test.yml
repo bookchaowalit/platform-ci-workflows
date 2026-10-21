@@ -46,6 +46,32 @@ jobs:
       test-command: python check_db.py
       postgres: true
 
+  gate-tests:
+    # Failure paths of the coverage gate and require-tests, which the reusable-workflow jobs
+    # below cannot show (a called workflow cannot be expected to fail): tests/gates_test.py.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      # renovate: datasource=pypi depName=uv
+      UV_VERSION: "0.13.1"
+      # renovate: datasource=pypi depName=pyyaml
+      PYYAML_VERSION: "6.0.3"
+      # renovate: datasource=pypi depName=coverage
+      COVERAGE_VERSION: "7.16.2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Gate script tests
+        run: uv run --no-project --with "pyyaml==$PYYAML_VERSION" --with "coverage==$COVERAGE_VERSION" python tests/gates_test.py
+
   node-coverage:
     # Exercises ci-node with require-tests and the coverage gate (npm + Vitest).
     uses: ./.github/workflows/ci-node.yml
