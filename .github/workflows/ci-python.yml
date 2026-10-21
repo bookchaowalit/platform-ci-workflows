@@ -218,6 +218,11 @@ jobs:
             echo "::error::Total coverage is below the ${THRESHOLD}% threshold, or no coverage data was found (.coverage)."
             exit 1
           fi
+          # Ratchet reminder (needs coverage.py >= 7: --format=total).
+          if total=$(python -m coverage report --format=total --precision=2 2>/dev/null) \
+            && awk -v c="$total" -v t="$THRESHOLD" 'BEGIN { exit !(c >= t + 2) }'; then
+            echo "::notice::Total coverage ${total}% is 2+ points above the threshold; raise coverage-threshold to ${total%.*} (ratchet)."
+          fi
 
       - name: Drop CI database
         if: always() && inputs.postgres && env.CI_DATABASE != ''

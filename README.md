@@ -97,7 +97,9 @@ as it adopts the TDD + SDD standard (ADR-0004 in `architecture-docs`).
 | `coverage-threshold: "80"` | `ci-python` | Runs `pytest --cov` (installs pinned `pytest-cov` if missing) and fails when **total** coverage is below the threshold (`coverage report --fail-under`). Set `[tool.coverage.run] source` so only your code is measured (and unimported files still count). A custom `test-command` must leave `.coverage` data itself; run `coverage combine` after `coverage run -p` |
 
 The threshold is a number from 0 to 100. Coverage files left in the checkout are deleted before
-the tests run, so only this run's data counts. Each run writes a coverage table to the job summary.
+the tests run, so only this run's data counts. Each run writes a coverage table to the job summary,
+and when coverage is 2 or more points above the threshold the job adds a notice to raise it
+(the ratchet rule of ADR-0004); the notice never fails the job.
 Choose the starting threshold just below the repository's current coverage, then raise it; never
 lower it without a recorded exception.
 
@@ -123,4 +125,7 @@ Suppress a finding only with a written reason, in the repository's own file:
 - Every action is pinned by SHA. Security binaries are pinned by version **and** SHA-256. After
   Renovate bumps a `*_VERSION`, run `scripts/tool-checksums.sh` and paste the new `*_SHA256`.
 - [`self-test.yml`](.github/workflows/self-test.yml) runs actionlint, shellcheck and the security
-  scan on this repository.
+  scan on this repository, calls `ci-node` / `ci-python` on the fixtures in `tests/fixtures/`, and
+  runs [`tests/gates_test.py`](tests/gates_test.py), which executes the gate and Test step scripts
+  against crafted inputs to prove the failure paths (below threshold, missing or stale data,
+  zero lines, invalid thresholds, `require-tests`).
