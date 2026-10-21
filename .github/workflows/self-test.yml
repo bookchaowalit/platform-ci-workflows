@@ -46,5 +46,24 @@ jobs:
       test-command: python check_db.py
       postgres: true
 
+  node-coverage:
+    # Exercises ci-node with require-tests and the coverage gate (npm + Vitest).
+    uses: ./.github/workflows/ci-node.yml
+    with:
+      working-directory: tests/fixtures/node-coverage
+      lint-command: ""
+      typecheck-command: ""
+      require-tests: true
+      coverage-threshold: "80"
+
+  python-coverage:
+    # Exercises ci-python's coverage gate (pytest-cov installed by the workflow).
+    uses: ./.github/workflows/ci-python.yml
+    with:
+      working-directory: tests/fixtures/python-coverage
+      install-command: uv pip install pytest
+      typecheck-command: ""
+      coverage-threshold: "80"
+
   security:
     uses: ./.github/workflows/security.yml
