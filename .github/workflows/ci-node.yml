@@ -176,7 +176,8 @@ jobs:
             "$PM" run typecheck
           elif [ -f tsconfig.json ]; then
             # npm needs `--`, or it reads --noEmit as its own config flag and drops it.
-            if [ "$PM" = npm ]; then npm exec -- tsc --noEmit; else pnpm exec tsc --noEmit; fi
+            # --no: never download the unrelated `tsc` package when typescript is not installed.
+            if [ "$PM" = npm ]; then npm exec --no -- tsc --noEmit; else pnpm exec tsc --noEmit; fi
           else
             echo "No typecheck script or tsconfig.json; typecheck skipped."
           fi
@@ -189,6 +190,8 @@ jobs:
           REQUIRE_TESTS: ${{ inputs.require-tests }}
           THRESHOLD: ${{ inputs.coverage-threshold }}
         run: |
+          # A committed or stale summary must not satisfy the gate.
+          if [ -n "$THRESHOLD" ]; then rm -rf coverage; fi
           if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
           run_bin() { if [ "$PM" = npm ]; then npm exec -- "$@"; else pnpm exec "$@"; fi; }  # npm eats flags without `--`
           has_dep() { node -e 'const p=require("./package.json"); process.exit({...p.dependencies, ...p.devDependencies}[process.argv[1]] ? 0 : 1)' "$1"; }

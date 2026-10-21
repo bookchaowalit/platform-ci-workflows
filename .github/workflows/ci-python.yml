@@ -192,6 +192,8 @@ jobs:
           CMD: ${{ inputs.test-command }}
           THRESHOLD: ${{ inputs.coverage-threshold }}
         run: |
+          # Committed or stale coverage data must not satisfy the gate.
+          if [ -n "$THRESHOLD" ]; then rm -f .coverage .coverage.*; fi
           if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
           python -c 'import pytest' >/dev/null 2>&1 || uv pip install "pytest==$PYTEST_VERSION"
           if [ -n "$THRESHOLD" ]; then

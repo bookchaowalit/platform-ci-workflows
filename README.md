@@ -93,10 +93,11 @@ as it adopts the TDD + SDD standard (ADR-0004 in `architecture-docs`).
 | Input | Workflow | Effect |
 |---|---|---|
 | `require-tests: true` | `ci-node` | With `test-command: auto`, a missing `test` script fails the job instead of warning. (pytest already fails when it collects no tests.) |
-| `coverage-threshold: "80"` | `ci-node` | Runs `vitest run` (needs `@vitest/coverage-v8` or `-istanbul`) or `jest` directly with coverage and fails when **line** coverage is below the threshold. A custom `test-command` must write `coverage/coverage-summary.json` (json-summary reporter) itself |
-| `coverage-threshold: "80"` | `ci-python` | Runs `pytest --cov` (installs pinned `pytest-cov` if missing) and fails when **total** coverage is below the threshold (`coverage report --fail-under`). Set `[tool.coverage.run] source` so only your code is measured. A custom `test-command` must leave `.coverage` data itself |
+| `coverage-threshold: "80"` | `ci-node` | Runs `vitest run` (needs `@vitest/coverage-v8` or `-istanbul`; Vitest wins when both are listed) or `jest` directly with coverage and fails when **line** coverage is below the threshold. This bypasses the `test` script: if it adds flags, env or a wrapper (`--project`, `NODE_OPTIONS`, dotenv), pass a custom `test-command` that writes `coverage/coverage-summary.json` (json-summary reporter). Set `test.coverage.include` (Vitest) or `collectCoverageFrom` (Jest), or files no test imports are left out of the total |
+| `coverage-threshold: "80"` | `ci-python` | Runs `pytest --cov` (installs pinned `pytest-cov` if missing) and fails when **total** coverage is below the threshold (`coverage report --fail-under`). Set `[tool.coverage.run] source` so only your code is measured (and unimported files still count). A custom `test-command` must leave `.coverage` data itself; run `coverage combine` after `coverage run -p` |
 
-The threshold is a number from 0 to 100. Each run writes a coverage table to the job summary.
+The threshold is a number from 0 to 100. Coverage files left in the checkout are deleted before
+the tests run, so only this run's data counts. Each run writes a coverage table to the job summary.
 Choose the starting threshold just below the repository's current coverage, then raise it; never
 lower it without a recorded exception.
 
