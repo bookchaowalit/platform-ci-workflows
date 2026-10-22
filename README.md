@@ -9,6 +9,8 @@ get no CI/CD.
 | [`ci-node.yml`](.github/workflows/ci-node.yml) | npm/pnpm install (lockfile required), Biome or ESLint, typecheck, Vitest / `test` script, optional coverage gate, optional build |
 | [`ci-python.yml`](.github/workflows/ci-python.yml) | uv install, Ruff lint + format check, mypy or pyright, pytest (or a custom test command), optional coverage gate |
 | [`security.yml`](.github/workflows/security.yml) | Gitleaks, Semgrep CE, OSV-Scanner, Trivy fs (vuln + IaC misconfig) |
+| [`deploy-railway.yml`](.github/workflows/deploy-railway.yml) | CD (v1.2.0): after CI passes on `main`, deploy that exact commit from the service's GitHub source, wait, smoke-test (health + commit), fail loudly with a rollback command |
+| [`deploy-vercel.yml`](.github/workflows/deploy-vercel.yml) | The same for a Vercel project, through the REST API with `gitSource` at the commit SHA (no CLI, no upload). Not adopted yet: needs the owner's OK under D9 |
 
 Everything runs as pinned binaries or pinned packages, without Docker, so the same workflows
 run on GitHub-hosted runners and on the Railway self-hosted runner.
@@ -119,6 +121,52 @@ Suppress a finding only with a written reason, in the repository's own file:
 `.gitleaksignore` (fingerprint), `# nosemgrep: <rule-id>` + reason, `osv-scanner.toml`
 (`[[IgnoredVulns]]` with `reason` and `ignoreUntil`), `.trivyignore.yaml` (with `statement`).
 
+## Deploy (CD)
+
+Owner decision D3 (2026-10-23, ADR-0003): production deploys start from Git after CI passes,
+end with a post-deploy smoke test, and never come from a working tree. The deploy workflows
+are a job **in the caller's CI workflow** that `needs:` the CI jobs, so a red CI never deploys:
+
+```yaml
+  deploy:
+    needs: [api, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.CD_DEPLOY == 'true'
+    uses: bookchaowalit/platform-ci-workflows/.github/workflows/deploy-railway.yml@<sha> # v1.2.0
+    with:
+      service-id: <railway service id>
+      environment-id: <railway production environment id>
+      health-url: https://<service>.up.railway.app/health
+      commit-url: https://<service>.up.railway.app/health   # optional: JSON with "commit"
+    secrets:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+```
+
+What a run does, in order (each step fails the job with an `::error` annotation):
+
+1. **Check the commit:** refuses any ref but `allowed-ref` (`refs/heads/main`); if `main` has
+   already moved on, it skips (the newer commit's own run deploys it), so a slow run never
+   deploys an older commit over a newer one. One deploy per service at a time (`concurrency`,
+   never cancelled midway).
+2. **Record the live deployment** (for the rollback hint).
+3. **Deploy the commit:** Railway `serviceInstanceDeployV2(commitSha: GITHUB_SHA)` (Railway builds
+   the commit from its GitHub source) or Vercel `POST /v13/deployments` with
+   `gitSource.sha = GITHUB_SHA`, `target: production`.
+4. **Wait** until Railway reports `SUCCESS`/`SLEEPING` or Vercel `READY`; `FAILED`, `CRASHED`,
+   `ERROR`, a timeout, or a deployment of any other commit fails.
+5. **Smoke test:** `health-url` must answer 2xx (retried, so a sleeping service can wake), with
+   `health-expect` in the body if set; with `commit-url`, the JSON field `commit-field` must name
+   the deployed SHA.
+6. **On failure:** the job summary and an `::error` annotation give the rollback command for the
+   last good deployment (`deploymentRollback(id: …)` / `vercel rollback …`).
+
+Prerequisites per service: a Railway **project token** for the production environment (repository
+secret `RAILWAY_TOKEN`; never the workspace-wide API token), and the service's own GitHub branch
+trigger removed, so Railway does not deploy `main` by itself (with "Wait for CI", that trigger
+waits on every GitHub app's check suite and never fires; see the pilot runbook in
+`finance-accounts-api/docs/runbooks/cd-pilot.md`). For Vercel: a token scoped to the team and
+`"git": {"deploymentEnabled": {"main": false}}` in `vercel.json`. `vars.CD_DEPLOY` keeps the job
+off until the owner turns it on. The runner needs `curl` and `jq` (GitHub-hosted images have both).
+
 ## Versioning
 
 - Tags `v1.x.y` are immutable; `v1` moves to the latest `v1.x.y`. Callers pin a SHA.
@@ -128,4 +176,6 @@ Suppress a finding only with a written reason, in the repository's own file:
   scan on this repository, calls `ci-node` / `ci-python` on the fixtures in `tests/fixtures/`, and
   runs [`tests/gates_test.py`](tests/gates_test.py), which executes the gate and Test step scripts
   against crafted inputs to prove the failure paths (below threshold, missing or stale data,
-  zero lines, invalid thresholds, `require-tests`).
+  zero lines, invalid thresholds, `require-tests`), and [`tests/deploy_test.py`](tests/deploy_test.py),
+  which runs every deploy step script against a local stub of the GitHub, Railway and Vercel APIs
+  (refused ref, stale commit, failed or wrong-commit deployment, smoke failures, rollback hint).

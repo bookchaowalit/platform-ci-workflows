@@ -1,0 +1,259 @@
+# Reusable CD for a Vercel project (ADR-0003, owner decision D3): after CI passes on main, create a
+# production deployment of that exact commit from Git, wait for it, smoke-test it, and fail loudly
+# with a rollback command when anything is wrong.
+#
+# The deployment is created through the Vercel REST API with `gitSource` (owner/repo + SHA), so
+# Vercel clones the commit itself: no `vercel deploy` from a working tree (owner decision D9).
+# Turn Vercel's own Git deploys of main off in the project (vercel.json
+# `"git": {"deploymentEnabled": {"main": false}}`), otherwise main deploys twice and before CI.
+# Not adopted by any repository yet: a project moves to it only with the owner's OK (D9).
+#
+# Caller example:
+#   deploy:
+#     needs: [web, security]
+#     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.CD_DEPLOY == 'true'
+#     uses: bookchaowalit/platform-ci-workflows/.github/workflows/deploy-vercel.yml@<sha> # v1.2.0
+#     with:
+#       project-id: prj_xxx
+#       team-id: team_xxx
+#       health-url: https://example.com/
+#     secrets:
+#       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+name: deploy-vercel
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON runs-on value. '"ubuntu-24.04"' for public repos, '["self-hosted","linux","x64","railway"]' for private.
+        type: string
+        default: '"ubuntu-24.04"'
+      project-id:
+        description: Vercel project ID (prj_...).
+        type: string
+        required: true
+      team-id:
+        description: Vercel team ID (team_...). "" for a personal account.
+        type: string
+        default: ""
+      health-url:
+        description: Production URL that must answer 2xx after the deploy.
+        type: string
+        required: true
+      health-expect:
+        description: Text the health response body must contain. "" checks the status only.
+        type: string
+        default: ""
+      commit-url:
+        description: Optional URL whose JSON body names the running commit (field `commit-field`). "" relies on Vercel's deployment record.
+        type: string
+        default: ""
+      commit-field:
+        type: string
+        default: commit
+      allowed-ref:
+        type: string
+        default: refs/heads/main
+      deploy-timeout-minutes:
+        type: number
+        default: 15
+      timeout-minutes:
+        description: Whole-job limit; keep it above deploy-timeout-minutes plus the smoke test.
+        type: number
+        default: 30
+      smoke-attempts:
+        type: number
+        default: 12
+      smoke-interval-seconds:
+        type: number
+        default: 10
+    secrets:
+      VERCEL_TOKEN:
+        description: Vercel token limited to the team/scope of the project.
+        required: true
+    outputs:
+      deployment-id:
+        value: ${{ jobs.deploy.outputs.deployment-id }}
+      skipped:
+        value: ${{ jobs.deploy.outputs.skipped }}
+
+permissions:
+  contents: read
+
+env:
+  VERCEL_API_URL: https://api.vercel.com
+
+jobs:
+  deploy:
+    name: deploy (vercel)
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: deploy-vercel-${{ inputs.project-id }}
+      cancel-in-progress: false
+    outputs:
+      deployment-id: ${{ steps.deploy.outputs.deployment-id }}
+      skipped: ${{ steps.commit.outputs.skip }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check the commit
+        id: commit
+        env:
+          ALLOWED_REF: ${{ inputs.allowed-ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF" != "$ALLOWED_REF" ]; then
+            echo "::error title=Deploy refused::only $ALLOWED_REF deploys; this run is $GITHUB_REF"
+            exit 1
+          fi
+          tip=$(curl -fsS --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.sha" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/${ALLOWED_REF#refs/heads/}")
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice title=Deploy skipped::${ALLOWED_REF#refs/heads/} is at ${tip:0:7}, newer than ${GITHUB_SHA:0:7}; that commit's run deploys it"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record the live deployment
+        id: live
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          PROJECT_ID: ${{ inputs.project-id }}
+          TEAM_ID: ${{ inputs.team-id }}
+        run: |
+          out=$(curl -fsS --retry 3 -G "$VERCEL_API_URL/v6/deployments" -H "Authorization: Bearer $VERCEL_TOKEN" \
+            --data-urlencode "projectId=$PROJECT_ID" --data-urlencode "target=production" \
+            --data-urlencode "state=READY" --data-urlencode "limit=1" \
+            ${TEAM_ID:+--data-urlencode "teamId=$TEAM_ID"})
+          {
+            echo "id=$(jq -r '.deployments[0].uid // ""' <<<"$out")"
+            echo "commit=$(jq -r '.deployments[0].meta.githubCommitSha // ""' <<<"$out")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy the commit
+        id: deploy
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          PROJECT_ID: ${{ inputs.project-id }}
+          TEAM_ID: ${{ inputs.team-id }}
+          ALLOWED_REF: ${{ inputs.allowed-ref }}
+        run: |
+          body=$(jq -n --arg p "$PROJECT_ID" --arg org "${GITHUB_REPOSITORY%%/*}" --arg repo "${GITHUB_REPOSITORY#*/}" \
+            --arg ref "${ALLOWED_REF#refs/heads/}" --arg sha "$GITHUB_SHA" \
+            '{name: $p, project: $p, target: "production", gitSource: {type: "github", org: $org, repo: $repo, ref: $ref, sha: $sha}}')
+          code=$(curl -sS -o "$RUNNER_TEMP/deploy.json" -w '%{http_code}' -X POST \
+            "$VERCEL_API_URL/v13/deployments${TEAM_ID:+?teamId=$TEAM_ID}" \
+            -H "Authorization: Bearer $VERCEL_TOKEN" -H "Content-Type: application/json" -d "$body")
+          id=$(jq -r '.id // ""' "$RUNNER_TEMP/deploy.json")
+          if [ "${code:0:1}" != 2 ] || [ -z "$id" ]; then
+            echo "::error title=Vercel refused the deploy::HTTP $code $(jq -c '.error // {}' "$RUNNER_TEMP/deploy.json")"
+            exit 1
+          fi
+          echo "deployment-id=$id" >> "$GITHUB_OUTPUT"
+          echo "Deploying ${GITHUB_SHA:0:7} as Vercel deployment $id"
+
+      - name: Wait for the deployment
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          TEAM_ID: ${{ inputs.team-id }}
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          TIMEOUT_MINUTES: ${{ inputs.deploy-timeout-minutes }}
+          POLL_SECONDS: "10"
+        run: |
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          while :; do
+            out=$(curl -fsS --retry 3 "$VERCEL_API_URL/v13/deployments/$DEPLOYMENT_ID${TEAM_ID:+?teamId=$TEAM_ID}" \
+              -H "Authorization: Bearer $VERCEL_TOKEN")
+            state=$(jq -r '.readyState // "UNKNOWN"' <<<"$out")
+            case "$state" in
+              READY) break ;;
+              ERROR|CANCELED)
+                echo "::error title=Deploy $state::Vercel deployment $DEPLOYMENT_ID ended $state"
+                exit 1 ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error title=Deploy timed out::Vercel deployment $DEPLOYMENT_ID still $state after $TIMEOUT_MINUTES minutes"
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+          commit=$(jq -r '.meta.githubCommitSha // ""' <<<"$out")
+          if [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "::error title=Wrong commit::Vercel deployment $DEPLOYMENT_ID is ${commit:-unknown}, expected $GITHUB_SHA"
+            exit 1
+          fi
+          echo "Vercel deployment $DEPLOYMENT_ID is READY at ${commit:0:7}"
+
+      - name: Smoke test
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          HEALTH_URL: ${{ inputs.health-url }}
+          HEALTH_EXPECT: ${{ inputs.health-expect }}
+          COMMIT_URL: ${{ inputs.commit-url }}
+          COMMIT_FIELD: ${{ inputs.commit-field }}
+          ATTEMPTS: ${{ inputs.smoke-attempts }}
+          INTERVAL: ${{ inputs.smoke-interval-seconds }}
+        run: |
+          probe() {  # url -> body on stdout when 2xx
+            curl -fsS --max-time 30 "$1"
+          }
+          ok=false
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            if body=$(probe "$HEALTH_URL") && { [ -z "$HEALTH_EXPECT" ] || grep -qF -- "$HEALTH_EXPECT" <<<"$body"; }; then
+              ok=true
+              break
+            fi
+            echo "health attempt $attempt/$ATTEMPTS failed"
+            [ "$attempt" -lt "$ATTEMPTS" ] && sleep "$INTERVAL"
+          done
+          if [ "$ok" != true ]; then
+            echo "::error title=Smoke test failed::$HEALTH_URL did not answer 2xx${HEALTH_EXPECT:+ with \"$HEALTH_EXPECT\"} after $ATTEMPTS attempts"
+            exit 1
+          fi
+          echo "health OK: $HEALTH_URL"
+          if [ -n "$COMMIT_URL" ]; then
+            running=$(probe "$COMMIT_URL" | jq -r --arg f "$COMMIT_FIELD" '.[$f] // ""')
+            if [ "${#running}" -lt 7 ] || [ "${GITHUB_SHA#"$running"}" = "$GITHUB_SHA" ]; then
+              echo "::error title=Smoke test: wrong commit::$COMMIT_URL reports '${running:-nothing}', expected $GITHUB_SHA"
+              exit 1
+            fi
+            echo "commit OK: ${running:0:7}"
+          fi
+
+      - name: Summary
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          HEALTH_URL: ${{ inputs.health-url }}
+        run: |
+          echo "### Deployed ${GITHUB_SHA:0:7} to Vercel production" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment \`$DEPLOYMENT_ID\`, health \`$HEALTH_URL\` OK." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rollback hint
+        if: failure() && steps.commit.outputs.skip == 'false'
+        env:
+          PREV_ID: ${{ steps.live.outputs.id }}
+          PREV_COMMIT: ${{ steps.live.outputs.commit }}
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          PROJECT_ID: ${{ inputs.project-id }}
+        run: |
+          {
+            echo "### Deploy of ${GITHUB_SHA:0:7} FAILED"
+            echo "New deployment: \`${DEPLOYMENT_ID:-not created}\`, project \`$PROJECT_ID\`."
+            if [ -n "$PREV_ID" ]; then
+              echo "If production now serves the failed deployment, promote the last good one \`$PREV_ID\` (commit \`${PREV_COMMIT:0:7}\`):"
+              echo '```bash'
+              echo "vercel rollback $PREV_ID"
+              echo '```'
+              echo "or Vercel dashboard → project → Deployments → that deployment → Instant Rollback. Then revert the commit on main."
+            else
+              echo "No earlier READY production deployment was found: check the project in the Vercel dashboard."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Production deploy failed::${GITHUB_SHA:0:7} did not pass. Rollback: vercel rollback ${PREV_ID:-?} — see the job summary"

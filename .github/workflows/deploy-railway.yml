@@ -1,0 +1,272 @@
+# Reusable CD for a Railway service (ADR-0003, owner decision D3): after CI passes on main, deploy
+# that exact commit from the service's GitHub source, wait for it, smoke-test it, and fail loudly
+# with a rollback command when anything is wrong.
+#
+# Railway builds the commit itself (serviceInstanceDeployV2 with commitSha), so nothing is uploaded
+# from a working tree. The service keeps its GitHub repo as the source but has no branch trigger
+# (auto-deploy off), so Railway's "Wait for CI" on unrelated check suites no longer matters.
+#
+# Caller example (append to the repository's CI workflow, after the CI jobs):
+#   deploy:
+#     needs: [api, security]
+#     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.CD_DEPLOY == 'true'
+#     uses: bookchaowalit/platform-ci-workflows/.github/workflows/deploy-railway.yml@<sha> # v1.2.0
+#     with:
+#       service-id: 99890e22-3638-457f-aed0-af23190b28f0
+#       environment-id: 6ea4583c-ec3b-4e87-a2c1-d571a38e15b9
+#       health-url: https://finance-accounts-api-production.up.railway.app/health
+#     secrets:
+#       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+#
+# RAILWAY_TOKEN is a Railway *project* token for that project and environment (sent as
+# Project-Access-Token), never the workspace-wide API token.
+name: deploy-railway
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON runs-on value. '"ubuntu-24.04"' for public repos, '["self-hosted","linux","x64","railway"]' for private.
+        type: string
+        default: '"ubuntu-24.04"'
+      service-id:
+        description: Railway service ID.
+        type: string
+        required: true
+      environment-id:
+        description: Railway environment ID (production).
+        type: string
+        required: true
+      health-url:
+        description: URL that must answer 2xx after the deploy, e.g. https://<service>.up.railway.app/health.
+        type: string
+        required: true
+      health-expect:
+        description: Text the health response body must contain. "" checks the status only.
+        type: string
+        default: ""
+      commit-url:
+        description: >-
+          Optional URL whose JSON body names the running commit (field `commit-field`); it must equal the
+          deployed SHA (a full SHA or a 7+ character prefix). "" relies on Railway's deployment record alone.
+        type: string
+        default: ""
+      commit-field:
+        description: Top-level JSON field in the commit-url response that holds the commit.
+        type: string
+        default: commit
+      allowed-ref:
+        description: The only ref that may deploy.
+        type: string
+        default: refs/heads/main
+      deploy-timeout-minutes:
+        description: How long to wait for Railway to build and start the commit.
+        type: number
+        default: 15
+      timeout-minutes:
+        description: Whole-job limit; keep it above deploy-timeout-minutes plus the smoke test.
+        type: number
+        default: 30
+      smoke-attempts:
+        description: Smoke-test attempts (a sleeping service needs a few to wake).
+        type: number
+        default: 12
+      smoke-interval-seconds:
+        type: number
+        default: 10
+    secrets:
+      RAILWAY_TOKEN:
+        description: Railway project token (project + environment scoped).
+        required: true
+    outputs:
+      deployment-id:
+        description: Railway deployment ID ("" when skipped).
+        value: ${{ jobs.deploy.outputs.deployment-id }}
+      skipped:
+        description: '"true" when a newer commit is already on the branch (its own run deploys it).'
+        value: ${{ jobs.deploy.outputs.skipped }}
+
+permissions:
+  contents: read
+
+env:
+  RAILWAY_GRAPHQL_URL: https://backboard.railway.com/graphql/v2
+
+jobs:
+  deploy:
+    name: deploy (railway)
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # One deploy per service at a time; a newer queued run replaces an older queued one.
+    concurrency:
+      group: deploy-railway-${{ inputs.service-id }}
+      cancel-in-progress: false
+    outputs:
+      deployment-id: ${{ steps.deploy.outputs.deployment-id }}
+      skipped: ${{ steps.commit.outputs.skip }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check the commit
+        id: commit
+        env:
+          ALLOWED_REF: ${{ inputs.allowed-ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF" != "$ALLOWED_REF" ]; then
+            echo "::error title=Deploy refused::only $ALLOWED_REF deploys; this run is $GITHUB_REF"
+            exit 1
+          fi
+          tip=$(curl -fsS --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.sha" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/${ALLOWED_REF#refs/heads/}")
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice title=Deploy skipped::${ALLOWED_REF#refs/heads/} is at ${tip:0:7}, newer than ${GITHUB_SHA:0:7}; that commit's run deploys it"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record the live deployment
+        id: live
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          SERVICE_ID: ${{ inputs.service-id }}
+          ENVIRONMENT_ID: ${{ inputs.environment-id }}
+        run: |
+          # shellcheck disable=SC2016 # $s, $e, $c, $id are GraphQL variables, not shell
+          query='query($s: String!, $e: String!) { deployments(first: 1, input: {serviceId: $s, environmentId: $e, status: {in: [SUCCESS, SLEEPING]}}) { edges { node { id meta } } } }'
+          body=$(jq -n --arg q "$query" --arg s "$SERVICE_ID" --arg e "$ENVIRONMENT_ID" '{query: $q, variables: {s: $s, e: $e}}')
+          out=$(curl -fsS --retry 3 "$RAILWAY_GRAPHQL_URL" -H "Project-Access-Token: $RAILWAY_TOKEN" -H "Content-Type: application/json" -d "$body")
+          if jq -e '.errors' <<<"$out" >/dev/null; then
+            echo "::error title=Railway API::$(jq -c '[.errors[].message]' <<<"$out")"
+            exit 1
+          fi
+          {
+            echo "id=$(jq -r '.data.deployments.edges[0].node.id // ""' <<<"$out")"
+            echo "commit=$(jq -r '.data.deployments.edges[0].node.meta.commitHash // ""' <<<"$out")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy the commit
+        id: deploy
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          SERVICE_ID: ${{ inputs.service-id }}
+          ENVIRONMENT_ID: ${{ inputs.environment-id }}
+        run: |
+          # shellcheck disable=SC2016 # $s, $e, $c, $id are GraphQL variables, not shell
+          query='mutation($s: String!, $e: String!, $c: String!) { serviceInstanceDeployV2(serviceId: $s, environmentId: $e, commitSha: $c) }'
+          body=$(jq -n --arg q "$query" --arg s "$SERVICE_ID" --arg e "$ENVIRONMENT_ID" --arg c "$GITHUB_SHA" '{query: $q, variables: {s: $s, e: $e, c: $c}}')
+          out=$(curl -fsS "$RAILWAY_GRAPHQL_URL" -H "Project-Access-Token: $RAILWAY_TOKEN" -H "Content-Type: application/json" -d "$body")
+          id=$(jq -r '.data.serviceInstanceDeployV2 // ""' <<<"$out")
+          if [ -z "$id" ]; then
+            echo "::error title=Railway refused the deploy::$(jq -c '[.errors[]?.message]' <<<"$out")"
+            exit 1
+          fi
+          echo "deployment-id=$id" >> "$GITHUB_OUTPUT"
+          echo "Deploying ${GITHUB_SHA:0:7} as Railway deployment $id"
+
+      - name: Wait for the deployment
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          TIMEOUT_MINUTES: ${{ inputs.deploy-timeout-minutes }}
+          POLL_SECONDS: "10"
+        run: |
+          # shellcheck disable=SC2016 # $s, $e, $c, $id are GraphQL variables, not shell
+          query='query($id: String!) { deployment(id: $id) { status meta } }'
+          body=$(jq -n --arg q "$query" --arg id "$DEPLOYMENT_ID" '{query: $q, variables: {id: $id}}')
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          status=""
+          while :; do
+            out=$(curl -fsS --retry 3 "$RAILWAY_GRAPHQL_URL" -H "Project-Access-Token: $RAILWAY_TOKEN" -H "Content-Type: application/json" -d "$body")
+            status=$(jq -r '.data.deployment.status // "UNKNOWN"' <<<"$out")
+            case "$status" in
+              SUCCESS|SLEEPING) break ;;
+              FAILED|CRASHED|REMOVED|SKIPPED|CANCELLED|NEEDS_APPROVAL)
+                echo "::error title=Deploy $status::Railway deployment $DEPLOYMENT_ID ended $status"
+                exit 1 ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error title=Deploy timed out::Railway deployment $DEPLOYMENT_ID still $status after $TIMEOUT_MINUTES minutes"
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+          commit=$(jq -r '.data.deployment.meta.commitHash // ""' <<<"$out")
+          if [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "::error title=Wrong commit::Railway deployment $DEPLOYMENT_ID is ${commit:-unknown}, expected $GITHUB_SHA"
+            exit 1
+          fi
+          echo "Railway deployment $DEPLOYMENT_ID is $status at ${commit:0:7}"
+
+      - name: Smoke test
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          HEALTH_URL: ${{ inputs.health-url }}
+          HEALTH_EXPECT: ${{ inputs.health-expect }}
+          COMMIT_URL: ${{ inputs.commit-url }}
+          COMMIT_FIELD: ${{ inputs.commit-field }}
+          ATTEMPTS: ${{ inputs.smoke-attempts }}
+          INTERVAL: ${{ inputs.smoke-interval-seconds }}
+        run: |
+          probe() {  # url -> body on stdout when 2xx
+            curl -fsS --max-time 30 "$1"
+          }
+          ok=false
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            if body=$(probe "$HEALTH_URL") && { [ -z "$HEALTH_EXPECT" ] || grep -qF -- "$HEALTH_EXPECT" <<<"$body"; }; then
+              ok=true
+              break
+            fi
+            echo "health attempt $attempt/$ATTEMPTS failed"
+            [ "$attempt" -lt "$ATTEMPTS" ] && sleep "$INTERVAL"
+          done
+          if [ "$ok" != true ]; then
+            echo "::error title=Smoke test failed::$HEALTH_URL did not answer 2xx${HEALTH_EXPECT:+ with \"$HEALTH_EXPECT\"} after $ATTEMPTS attempts"
+            exit 1
+          fi
+          echo "health OK: $HEALTH_URL"
+          if [ -n "$COMMIT_URL" ]; then
+            running=$(probe "$COMMIT_URL" | jq -r --arg f "$COMMIT_FIELD" '.[$f] // ""')
+            if [ "${#running}" -lt 7 ] || [ "${GITHUB_SHA#"$running"}" = "$GITHUB_SHA" ]; then
+              echo "::error title=Smoke test: wrong commit::$COMMIT_URL reports '${running:-nothing}', expected $GITHUB_SHA"
+              exit 1
+            fi
+            echo "commit OK: ${running:0:7}"
+          fi
+
+      - name: Summary
+        if: steps.commit.outputs.skip == 'false'
+        env:
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          HEALTH_URL: ${{ inputs.health-url }}
+        run: |
+          echo "### Deployed ${GITHUB_SHA:0:7} to Railway" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment \`$DEPLOYMENT_ID\`, health \`$HEALTH_URL\` OK." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rollback hint
+        if: failure() && steps.commit.outputs.skip == 'false'
+        env:
+          PREV_ID: ${{ steps.live.outputs.id }}
+          PREV_COMMIT: ${{ steps.live.outputs.commit }}
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          SERVICE_ID: ${{ inputs.service-id }}
+        run: |
+          {
+            echo "### Deploy of ${GITHUB_SHA:0:7} FAILED"
+            echo "New deployment: \`${DEPLOYMENT_ID:-not created}\`, service \`$SERVICE_ID\`."
+            if [ -n "$PREV_ID" ]; then
+              echo "Roll back to the last good deployment \`$PREV_ID\` (commit \`${PREV_COMMIT:0:7}\`):"
+              echo '```bash'
+              echo "railway api 'mutation { deploymentRollback(id: \"$PREV_ID\") }'"
+              echo '```'
+              echo "or Railway dashboard → service → Deployments → that deployment → Rollback. Then revert the commit on main."
+            else
+              echo "No earlier successful deployment was found: check the service in the Railway dashboard."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Production deploy failed::${GITHUB_SHA:0:7} did not pass. Rollback: deploymentRollback(id: \"${PREV_ID:-?}\") — see the job summary"
