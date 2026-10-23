@@ -1,10 +1,13 @@
-# Reusable CD for a Railway service (ADR-0003, owner decision D3): after CI passes on main, deploy
-# that exact commit from the service's GitHub source, wait for it, smoke-test it, and fail loudly
-# with a rollback command when anything is wrong.
+# Reusable CD for a Railway service (ADR-0003, owner decision D3): after CI passes on main, make sure
+# that exact commit is what runs, smoke-test it, and fail loudly with a rollback command when anything
+# is wrong. Two modes:
 #
-# Railway builds the commit itself (serviceInstanceDeployV2 with commitSha), so nothing is uploaded
-# from a working tree. The service keeps its GitHub repo as the source but has no branch trigger
-# (auto-deploy off), so Railway's "Wait for CI" on unrelated check suites no longer matters.
+#   mode: verify (v1.3.0, the owner's choice for the pilot) — Railway keeps deploying by itself from
+#     its GitHub branch trigger ("Wait for CI"). This job only reads: it waits for Railway's deployment
+#     of GITHUB_SHA, checks its commit, smoke-tests it and gives the rollback hint. No Railway setting
+#     changes and nothing is deployed from here.
+#   mode: deploy (v1.2.0) — this job asks Railway to build the commit (serviceInstanceDeployV2 with
+#     commitSha), for a service whose branch trigger was removed. Nothing is uploaded from a working tree.
 #
 # Caller example (append to the repository's CI workflow, after the CI jobs):
 #   deploy:
@@ -15,16 +18,23 @@
 #       service-id: 99890e22-3638-457f-aed0-af23190b28f0
 #       environment-id: 6ea4583c-ec3b-4e87-a2c1-d571a38e15b9
 #       health-url: https://finance-accounts-api-production.up.railway.app/health
+#       mode: verify
 #     secrets:
 #       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 #
 # RAILWAY_TOKEN is a Railway *project* token for that project and environment (sent as
-# Project-Access-Token), never the workspace-wide API token.
+# Project-Access-Token), never the workspace-wide API token. Railway has no read-only token type; a
+# project token is the smallest scope (one environment of one project). In verify mode the job sends
+# only read queries with it.
 name: deploy-railway
 
 on:
   workflow_call:
     inputs:
+      mode:
+        description: '"verify": wait for the deployment Railway makes itself (read-only). "deploy": ask Railway to deploy the commit.'
+        type: string
+        default: deploy
       runner:
         description: JSON runs-on value. '"ubuntu-24.04"' for public repos, '["self-hosted","linux","x64","railway"]' for private.
         type: string
@@ -60,7 +70,7 @@ on:
         type: string
         default: refs/heads/main
       deploy-timeout-minutes:
-        description: How long to wait for Railway to build and start the commit.
+        description: How long to wait for Railway to start (verify mode), build and run the commit.
         type: number
         default: 15
       timeout-minutes:
@@ -83,7 +93,7 @@ on:
         description: Railway deployment ID ("" when skipped).
         value: ${{ jobs.deploy.outputs.deployment-id }}
       skipped:
-        description: '"true" when a newer commit is already on the branch (its own run deploys it).'
+        description: '"true" when a newer commit is already on the branch, or Railway replaced this deployment with a newer one (that commit''s run checks it).'
         value: ${{ jobs.deploy.outputs.skipped }}
 
 permissions:
@@ -102,8 +112,8 @@ jobs:
       group: deploy-railway-${{ inputs.service-id }}
       cancel-in-progress: false
     outputs:
-      deployment-id: ${{ steps.deploy.outputs.deployment-id }}
-      skipped: ${{ steps.commit.outputs.skip }}
+      deployment-id: ${{ steps.deploy.outputs.deployment-id || steps.find.outputs.deployment-id }}
+      skipped: ${{ steps.commit.outputs.skip == 'true' || steps.wait.outputs.superseded == 'true' }}
     defaults:
       run:
         shell: bash
@@ -113,7 +123,12 @@ jobs:
         env:
           ALLOWED_REF: ${{ inputs.allowed-ref }}
           GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
         run: |
+          if [ "$MODE" != deploy ] && [ "$MODE" != verify ]; then
+            echo "::error title=Bad input::mode must be 'deploy' or 'verify', got '$MODE'"
+            exit 1
+          fi
           if [ "$GITHUB_REF" != "$ALLOWED_REF" ]; then
             echo "::error title=Deploy refused::only $ALLOWED_REF deploys; this run is $GITHUB_REF"
             exit 1
@@ -136,21 +151,24 @@ jobs:
           ENVIRONMENT_ID: ${{ inputs.environment-id }}
         run: |
           # shellcheck disable=SC2016 # $s, $e, $c, $id are GraphQL variables, not shell
-          query='query($s: String!, $e: String!) { deployments(first: 1, input: {serviceId: $s, environmentId: $e, status: {in: [SUCCESS, SLEEPING]}}) { edges { node { id meta } } } }'
+          # The newest deployment of another commit that ran (REMOVED = replaced later; still a rollback
+          # target). In verify mode Railway may already run GITHUB_SHA, so that one is not "last good".
+          query='query($s: String!, $e: String!) { deployments(first: 20, input: {serviceId: $s, environmentId: $e, status: {in: [SUCCESS, SLEEPING, REMOVED]}}) { edges { node { id status meta } } } }'
           body=$(jq -n --arg q "$query" --arg s "$SERVICE_ID" --arg e "$ENVIRONMENT_ID" '{query: $q, variables: {s: $s, e: $e}}')
           out=$(curl -fsS --retry 3 "$RAILWAY_GRAPHQL_URL" -H "Project-Access-Token: $RAILWAY_TOKEN" -H "Content-Type: application/json" -d "$body")
           if jq -e '.errors' <<<"$out" >/dev/null; then
             echo "::error title=Railway API::$(jq -c '[.errors[].message]' <<<"$out")"
             exit 1
           fi
+          prev=$(jq -c --arg sha "$GITHUB_SHA" '[.data.deployments.edges[].node | select(.meta.commitHash != $sha)][0] // {}' <<<"$out")
           {
-            echo "id=$(jq -r '.data.deployments.edges[0].node.id // ""' <<<"$out")"
-            echo "commit=$(jq -r '.data.deployments.edges[0].node.meta.commitHash // ""' <<<"$out")"
+            echo "id=$(jq -r '.id // ""' <<<"$prev")"
+            echo "commit=$(jq -r '.meta.commitHash // ""' <<<"$prev")"
           } >> "$GITHUB_OUTPUT"
 
       - name: Deploy the commit
         id: deploy
-        if: steps.commit.outputs.skip == 'false'
+        if: steps.commit.outputs.skip == 'false' && inputs.mode == 'deploy'
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           SERVICE_ID: ${{ inputs.service-id }}
@@ -168,13 +186,46 @@ jobs:
           echo "deployment-id=$id" >> "$GITHUB_OUTPUT"
           echo "Deploying ${GITHUB_SHA:0:7} as Railway deployment $id"
 
+      - name: Find Railway's deployment
+        id: find
+        if: steps.commit.outputs.skip == 'false' && inputs.mode == 'verify'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          SERVICE_ID: ${{ inputs.service-id }}
+          ENVIRONMENT_ID: ${{ inputs.environment-id }}
+          TIMEOUT_MINUTES: ${{ inputs.deploy-timeout-minutes }}
+          POLL_SECONDS: "10"
+        run: |
+          # shellcheck disable=SC2016 # $s, $e are GraphQL variables, not shell
+          query='query($s: String!, $e: String!) { deployments(first: 20, input: {serviceId: $s, environmentId: $e}) { edges { node { id status meta } } } }'
+          body=$(jq -n --arg q "$query" --arg s "$SERVICE_ID" --arg e "$ENVIRONMENT_ID" '{query: $q, variables: {s: $s, e: $e}}')
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          while :; do
+            out=$(curl -fsS --retry 3 "$RAILWAY_GRAPHQL_URL" -H "Project-Access-Token: $RAILWAY_TOKEN" -H "Content-Type: application/json" -d "$body")
+            if jq -e '.errors' <<<"$out" >/dev/null; then
+              echo "::error title=Railway API::$(jq -c '[.errors[].message]' <<<"$out")"
+              exit 1
+            fi
+            id=$(jq -r --arg sha "$GITHUB_SHA" '[.data.deployments.edges[].node | select(.meta.commitHash == $sha)][0].id // ""' <<<"$out")
+            [ -n "$id" ] && break
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error title=No deployment::Railway started no deployment of ${GITHUB_SHA:0:7} within $TIMEOUT_MINUTES minutes. Is the service's branch trigger on, and is \"Wait for CI\" stuck on queued check suites?"
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+          echo "deployment-id=$id" >> "$GITHUB_OUTPUT"
+          echo "Railway deployment $id is for ${GITHUB_SHA:0:7}"
+
       - name: Wait for the deployment
+        id: wait
         if: steps.commit.outputs.skip == 'false'
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id || steps.find.outputs.deployment-id }}
           TIMEOUT_MINUTES: ${{ inputs.deploy-timeout-minutes }}
           POLL_SECONDS: "10"
+          MODE: ${{ inputs.mode }}
         run: |
           # shellcheck disable=SC2016 # $s, $e, $c, $id are GraphQL variables, not shell
           query='query($id: String!) { deployment(id: $id) { status meta } }'
@@ -186,7 +237,15 @@ jobs:
             status=$(jq -r '.data.deployment.status // "UNKNOWN"' <<<"$out")
             case "$status" in
               SUCCESS|SLEEPING) break ;;
-              FAILED|CRASHED|REMOVED|SKIPPED|CANCELLED|NEEDS_APPROVAL)
+              SKIPPED|REMOVED)
+                if [ "$MODE" = verify ]; then  # Railway replaced it with a newer commit's deployment
+                  echo "::notice title=Superseded::Railway deployment $DEPLOYMENT_ID of ${GITHUB_SHA:0:7} is $status (a newer deployment replaced it); that commit's run checks it"
+                  echo "superseded=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+                echo "::error title=Deploy $status::Railway deployment $DEPLOYMENT_ID ended $status"
+                exit 1 ;;
+              FAILED|CRASHED|CANCELLED|NEEDS_APPROVAL)
                 echo "::error title=Deploy $status::Railway deployment $DEPLOYMENT_ID ended $status"
                 exit 1 ;;
             esac
@@ -204,7 +263,7 @@ jobs:
           echo "Railway deployment $DEPLOYMENT_ID is $status at ${commit:0:7}"
 
       - name: Smoke test
-        if: steps.commit.outputs.skip == 'false'
+        if: steps.commit.outputs.skip == 'false' && steps.wait.outputs.superseded != 'true'
         env:
           HEALTH_URL: ${{ inputs.health-url }}
           HEALTH_EXPECT: ${{ inputs.health-expect }}
@@ -240,12 +299,12 @@ jobs:
           fi
 
       - name: Summary
-        if: steps.commit.outputs.skip == 'false'
+        if: steps.commit.outputs.skip == 'false' && steps.wait.outputs.superseded != 'true'
         env:
-          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id || steps.find.outputs.deployment-id }}
           HEALTH_URL: ${{ inputs.health-url }}
         run: |
-          echo "### Deployed ${GITHUB_SHA:0:7} to Railway" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ${GITHUB_SHA:0:7} is live on Railway" >> "$GITHUB_STEP_SUMMARY"
           echo "Deployment \`$DEPLOYMENT_ID\`, health \`$HEALTH_URL\` OK." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Rollback hint
@@ -253,12 +312,12 @@ jobs:
         env:
           PREV_ID: ${{ steps.live.outputs.id }}
           PREV_COMMIT: ${{ steps.live.outputs.commit }}
-          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id }}
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment-id || steps.find.outputs.deployment-id }}
           SERVICE_ID: ${{ inputs.service-id }}
         run: |
           {
             echo "### Deploy of ${GITHUB_SHA:0:7} FAILED"
-            echo "New deployment: \`${DEPLOYMENT_ID:-not created}\`, service \`$SERVICE_ID\`."
+            echo "Deployment of this commit: \`${DEPLOYMENT_ID:-none found}\`, service \`$SERVICE_ID\`."
             if [ -n "$PREV_ID" ]; then
               echo "Roll back to the last good deployment \`$PREV_ID\` (commit \`${PREV_COMMIT:0:7}\`):"
               echo '```bash'

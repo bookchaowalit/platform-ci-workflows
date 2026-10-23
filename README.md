@@ -9,7 +9,7 @@ get no CI/CD.
 | [`ci-node.yml`](.github/workflows/ci-node.yml) | npm/pnpm install (lockfile required), Biome or ESLint, typecheck, Vitest / `test` script, optional coverage gate, optional build |
 | [`ci-python.yml`](.github/workflows/ci-python.yml) | uv install, Ruff lint + format check, mypy or pyright, pytest (or a custom test command), optional coverage gate |
 | [`security.yml`](.github/workflows/security.yml) | Gitleaks, Semgrep CE, OSV-Scanner, Trivy fs (vuln + IaC misconfig) |
-| [`deploy-railway.yml`](.github/workflows/deploy-railway.yml) | CD (v1.2.0): after CI passes on `main`, deploy that exact commit from the service's GitHub source, wait, smoke-test (health + commit), fail loudly with a rollback command |
+| [`deploy-railway.yml`](.github/workflows/deploy-railway.yml) | CD after CI passes on `main`: `mode: verify` (v1.3.0) waits for the deployment Railway makes itself and checks it, read-only; `mode: deploy` (v1.2.0) asks Railway to deploy that exact commit. Both smoke-test (health + commit) and fail loudly with a rollback command |
 | [`deploy-vercel.yml`](.github/workflows/deploy-vercel.yml) | The same for a Vercel project, through the REST API with `gitSource` at the commit SHA (no CLI, no upload). Not adopted yet: needs the owner's OK under D9 |
 
 Everything runs as pinned binaries or pinned packages, without Docker, so the same workflows
@@ -137,9 +137,23 @@ are a job **in the caller's CI workflow** that `needs:` the CI jobs, so a red CI
       environment-id: <railway production environment id>
       health-url: https://<service>.up.railway.app/health
       commit-url: https://<service>.up.railway.app/health   # optional: JSON with "commit"
+      mode: verify   # Railway deploys by itself; this job only checks (default: deploy)
     secrets:
       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 ```
+
+### Two modes (Railway)
+
+| | `mode: verify` (v1.3.0) | `mode: deploy` (v1.2.0) |
+|---|---|---|
+| Who deploys | Railway's own branch trigger ("Wait for CI"), as before | This job, with `serviceInstanceDeployV2(commitSha)` |
+| Railway settings | none change | the service's branch trigger must be removed first |
+| API calls with `RAILWAY_TOKEN` | read queries only | read queries + one deploy mutation |
+| A newer commit replaced this deployment (`SKIPPED`/`REMOVED`) | skip with a notice (that commit's run checks it) | failure |
+| Railway never starts a deployment of the SHA | failure after `deploy-timeout-minutes` ("is the trigger on / Wait for CI stuck?") | n/a |
+
+Railway has no read-only token type: the smallest scope is a **project token** for the one
+production environment (Project → Settings → Tokens). In verify mode the job only reads with it.
 
 What a run does, in order (each step fails the job with an `::error` annotation):
 
@@ -147,10 +161,12 @@ What a run does, in order (each step fails the job with an `::error` annotation)
    already moved on, it skips (the newer commit's own run deploys it), so a slow run never
    deploys an older commit over a newer one. One deploy per service at a time (`concurrency`,
    never cancelled midway).
-2. **Record the live deployment** (for the rollback hint).
-3. **Deploy the commit:** Railway `serviceInstanceDeployV2(commitSha: GITHUB_SHA)` (Railway builds
-   the commit from its GitHub source) or Vercel `POST /v13/deployments` with
-   `gitSource.sha = GITHUB_SHA`, `target: production`.
+2. **Record the last good deployment** of another commit (`SUCCESS`, `SLEEPING` or `REMOVED`), for
+   the rollback hint.
+3. **Deploy the commit** (deploy mode): Railway `serviceInstanceDeployV2(commitSha: GITHUB_SHA)`
+   (Railway builds the commit from its GitHub source) or Vercel `POST /v13/deployments` with
+   `gitSource.sha = GITHUB_SHA`, `target: production`. **Find Railway's deployment** (verify mode):
+   poll the service's deployments until one has `meta.commitHash = GITHUB_SHA`.
 4. **Wait** until Railway reports `SUCCESS`/`SLEEPING` or Vercel `READY`; `FAILED`, `CRASHED`,
    `ERROR`, a timeout, or a deployment of any other commit fails.
 5. **Smoke test:** `health-url` must answer 2xx (retried, so a sleeping service can wake), with
@@ -160,10 +176,9 @@ What a run does, in order (each step fails the job with an `::error` annotation)
    last good deployment (`deploymentRollback(id: …)` / `vercel rollback …`).
 
 Prerequisites per service: a Railway **project token** for the production environment (repository
-secret `RAILWAY_TOKEN`; never the workspace-wide API token), and the service's own GitHub branch
-trigger removed, so Railway does not deploy `main` by itself (with "Wait for CI", that trigger
-waits on every GitHub app's check suite and never fires; see the pilot runbook in
-`finance-accounts-api/docs/runbooks/cd-pilot.md`). For Vercel: a token scoped to the team and
+secret `RAILWAY_TOKEN`; never the workspace-wide API token). Deploy mode also needs the service's
+GitHub branch trigger removed, so Railway does not deploy `main` by itself; verify mode keeps it.
+Pilot: `finance-accounts-api/docs/runbooks/cd-pilot.md` (verify mode). For Vercel: a token scoped to the team and
 `"git": {"deploymentEnabled": {"main": false}}` in `vercel.json`. `vars.CD_DEPLOY` keeps the job
 off until the owner turns it on. The runner needs `curl` and `jq` (GitHub-hosted images have both).
 
@@ -178,4 +193,5 @@ off until the owner turns it on. The runner needs `curl` and `jq` (GitHub-hosted
   against crafted inputs to prove the failure paths (below threshold, missing or stale data,
   zero lines, invalid thresholds, `require-tests`), and [`tests/deploy_test.py`](tests/deploy_test.py),
   which runs every deploy step script against a local stub of the GitHub, Railway and Vercel APIs
-  (refused ref, stale commit, failed or wrong-commit deployment, smoke failures, rollback hint).
+  (refused ref, stale commit, failed or wrong-commit deployment, smoke failures, rollback hint, and
+  verify mode: waiting for Railway's deployment, superseded, never started, read-only calls).

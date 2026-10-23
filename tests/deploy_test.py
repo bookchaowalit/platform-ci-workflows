@@ -24,11 +24,13 @@ OLD = "b" * 40
 
 # Env names each step must receive from its `env:` block; the harness sets exactly these.
 STEP_ENV = {
-    "Check the commit": {"ALLOWED_REF", "GH_TOKEN"},
+    ("deploy-railway.yml", "Check the commit"): {"ALLOWED_REF", "GH_TOKEN", "MODE"},
+    ("deploy-vercel.yml", "Check the commit"): {"ALLOWED_REF", "GH_TOKEN"},
     "Smoke test": {"HEALTH_URL", "HEALTH_EXPECT", "COMMIT_URL", "COMMIT_FIELD", "ATTEMPTS", "INTERVAL"},
     ("deploy-railway.yml", "Record the live deployment"): {"RAILWAY_TOKEN", "SERVICE_ID", "ENVIRONMENT_ID"},
     ("deploy-railway.yml", "Deploy the commit"): {"RAILWAY_TOKEN", "SERVICE_ID", "ENVIRONMENT_ID"},
-    ("deploy-railway.yml", "Wait for the deployment"): {"RAILWAY_TOKEN", "DEPLOYMENT_ID", "TIMEOUT_MINUTES", "POLL_SECONDS"},
+    ("deploy-railway.yml", "Find Railway's deployment"): {"RAILWAY_TOKEN", "SERVICE_ID", "ENVIRONMENT_ID", "TIMEOUT_MINUTES", "POLL_SECONDS"},
+    ("deploy-railway.yml", "Wait for the deployment"): {"RAILWAY_TOKEN", "DEPLOYMENT_ID", "TIMEOUT_MINUTES", "POLL_SECONDS", "MODE"},
     ("deploy-railway.yml", "Rollback hint"): {"PREV_ID", "PREV_COMMIT", "DEPLOYMENT_ID", "SERVICE_ID"},
     ("deploy-vercel.yml", "Record the live deployment"): {"VERCEL_TOKEN", "PROJECT_ID", "TEAM_ID"},
     ("deploy-vercel.yml", "Deploy the commit"): {"VERCEL_TOKEN", "PROJECT_ID", "TEAM_ID", "ALLOWED_REF"},
@@ -65,6 +67,8 @@ class Stub:
         self.health_body = '{"status":"ok"}'
         self.running = SHA
         self.requests: list[tuple[str, str, str]] = []
+        # Railway deployment lists per `deployments(` query, newest first; the last one repeats.
+        self.lists = [[{"id": "dep-old", "status": "SUCCESS", "meta": {"commitHash": OLD}}]]
 
 
 STUB = Stub()
@@ -109,8 +113,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(200, {"errors": [{"message": "Repo not found"}], "data": None})
                 return self.reply(200, {"data": {"serviceInstanceDeployV2": "dep-new"}})
             if "deployments(" in query:
-                node = {"id": "dep-old", "meta": {"commitHash": OLD}}
-                return self.reply(200, {"data": {"deployments": {"edges": [{"node": node}]}}})
+                nodes = STUB.lists.pop(0) if len(STUB.lists) > 1 else STUB.lists[0]
+                edges = [{"node": n} for n in nodes]
+                return self.reply(200, {"data": {"deployments": {"edges": edges}}})
             if "deployment(id" in query:
                 status = STUB.statuses.pop(0) if len(STUB.statuses) > 1 else STUB.statuses[0]
                 meta = {"commitHash": STUB.deployed_commit}
@@ -168,7 +173,7 @@ def expect(label: str, condition: bool, detail: str = "") -> None:
 def common_cases(workflow: str, tmp: pathlib.Path, base: str) -> None:
     commit = step(workflow, "Check the commit")
     smoke = step(workflow, "Smoke test")
-    env = {"ALLOWED_REF": "refs/heads/main", "GH_TOKEN": "gh"}
+    env = {"ALLOWED_REF": "refs/heads/main", "GH_TOKEN": "gh", "MODE": "deploy"}
 
     STUB.reset()
     check(f"{workflow}: a branch other than main is refused",
@@ -226,7 +231,7 @@ def railway_cases(tmp: pathlib.Path, base: str) -> None:
     STUB.reset(); STUB.deploy_error = True
     check("railway: a refused deploy fails loudly", run(deploy, tmp, base, **ids), False, "Railway refused the deploy")
 
-    wait_env = {"RAILWAY_TOKEN": "rw-token", "DEPLOYMENT_ID": "dep-new", "TIMEOUT_MINUTES": "1", "POLL_SECONDS": "0"}
+    wait_env = {"RAILWAY_TOKEN": "rw-token", "DEPLOYMENT_ID": "dep-new", "TIMEOUT_MINUTES": "1", "POLL_SECONDS": "0", "MODE": "deploy"}
     STUB.reset()
     check("railway: waits through BUILDING/DEPLOYING to SUCCESS", run(wait, tmp, base, **wait_env), True, "SUCCESS")
     STUB.reset(); STUB.statuses = ["BUILDING", "SLEEPING"]
@@ -249,6 +254,67 @@ def railway_cases(tmp: pathlib.Path, base: str) -> None:
     (tmp / "summary.md").unlink()
     check("railway: rollback hint without a previous deployment",
           run(hint, tmp, base, **{**hint_env, "PREV_ID": "", "PREV_COMMIT": ""}), True, "No earlier successful deployment")
+
+
+def railway_verify_cases(tmp: pathlib.Path, base: str) -> None:
+    """mode: verify — Railway deploys by itself; the job only reads, waits, checks and smoke-tests."""
+    wf = "deploy-railway.yml"
+    commit = step(wf, "Check the commit")
+    live = step(wf, "Record the live deployment")
+    find = step(wf, "Find Railway's deployment")
+    wait = step(wf, "Wait for the deployment")
+    doc = yaml.safe_load((WORKFLOWS / wf).read_text())
+    steps = {s["name"]: s for s in doc["jobs"]["deploy"]["steps"]}
+    expect("verify: the deploy mutation never runs in verify mode",
+           "inputs.mode == 'deploy'" in steps["Deploy the commit"]["if"], steps["Deploy the commit"]["if"])
+    expect("verify: the find step runs only in verify mode",
+           "inputs.mode == 'verify'" in steps["Find Railway's deployment"]["if"], steps["Find Railway's deployment"]["if"])
+    expect("verify: smoke test is skipped when superseded",
+           "superseded != 'true'" in steps["Smoke test"]["if"], steps["Smoke test"]["if"])
+    expect("verify: mode defaults to deploy (v1.2.0 callers unchanged)",
+           doc[True]["workflow_call"]["inputs"]["mode"]["default"] == "deploy")  # PyYAML reads `on:` as True
+
+    STUB.reset()
+    check("verify: an unknown mode is refused",
+          run(commit, tmp, base, ALLOWED_REF="refs/heads/main", GH_TOKEN="gh", MODE="ship"), False, "mode must be")
+
+    ids = {"RAILWAY_TOKEN": "rw-token", "SERVICE_ID": "svc", "ENVIRONMENT_ID": "env"}
+    new = {"id": "dep-new", "status": "SUCCESS", "meta": {"commitHash": SHA}}
+    old = {"id": "dep-old", "status": "REMOVED", "meta": {"commitHash": OLD}}
+    STUB.reset(); STUB.lists = [[new, old]]
+    check("verify: last good skips the deployment of this very commit", run(live, tmp, base, **ids), True)
+    expect("verify: rollback target is the previous commit's deployment",
+           outputs(tmp) == {"id": "dep-old", "commit": OLD}, str(outputs(tmp)))
+
+    find_env = {**ids, "TIMEOUT_MINUTES": "1", "POLL_SECONDS": "0"}
+    STUB.reset(); STUB.lists = [[old], [old], [{**new, "status": "BUILDING"}, old]]
+    check("verify: waits until Railway starts a deployment of the SHA", run(find, tmp, base, **find_env), True, "dep-new")
+    expect("verify: deployment-id output", outputs(tmp) == {"deployment-id": "dep-new"}, str(outputs(tmp)))
+    sent = [r for r in STUB.requests if r[0] == "POST"]
+    expect("verify: only read queries, never a mutation",
+           all("mutation" not in json.loads(r[2])["query"] for r in sent), str(sent))
+    STUB.reset(); STUB.lists = [[old]]
+    check("verify: no deployment of the SHA times out loudly",
+          run(find, tmp, base, **{**find_env, "TIMEOUT_MINUTES": "0"}), False, "Railway started no deployment")
+    STUB.reset()
+    check("verify: a bad token fails", run(find, tmp, base, **{**find_env, "RAILWAY_TOKEN": "x"}), False, "Not Authorized")
+
+    wait_env = {"RAILWAY_TOKEN": "rw-token", "DEPLOYMENT_ID": "dep-new", "TIMEOUT_MINUTES": "1", "POLL_SECONDS": "0", "MODE": "verify"}
+    STUB.reset()
+    check("verify: waits to SUCCESS and checks the commit", run(wait, tmp, base, **wait_env), True, "SUCCESS")
+    STUB.reset(); STUB.statuses = ["BUILDING", "SLEEPING"]
+    check("verify: a sleeping service counts as up", run(wait, tmp, base, **wait_env), True, "SLEEPING")
+    for gone in ("SKIPPED", "REMOVED"):
+        STUB.reset(); STUB.statuses = ["BUILDING", gone]
+        check(f"verify: {gone} (replaced by a newer deployment) is a skip, not a failure",
+              run(wait, tmp, base, **wait_env), True, "Superseded")
+        expect(f"verify: superseded=true after {gone}", outputs(tmp) == {"superseded": "true"}, str(outputs(tmp)))
+    for bad in ("FAILED", "CRASHED"):
+        STUB.reset(); STUB.statuses = ["BUILDING", bad]
+        check(f"verify: {bad} fails loudly", run(wait, tmp, base, **wait_env), False, f"Deploy {bad}")
+    STUB.reset(); STUB.statuses = ["DEPLOYING"]
+    check("verify: a deployment that never finishes times out",
+          run(wait, tmp, base, **{**wait_env, "TIMEOUT_MINUTES": "0"}), False, "Deploy timed out")
 
 
 def vercel_cases(tmp: pathlib.Path, base: str) -> None:
@@ -299,6 +365,7 @@ def main() -> int:
             for workflow in ("deploy-railway.yml", "deploy-vercel.yml"):
                 common_cases(workflow, tmp, base)
             railway_cases(tmp, base)
+            railway_verify_cases(tmp, base)
             vercel_cases(tmp, base)
     finally:
         server.shutdown()
