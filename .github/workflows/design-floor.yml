@@ -36,6 +36,10 @@ on:
         description: File with the Node.js version (.nvmrc, .node-version, package.json), relative to the repo root.
         type: string
         default: ""
+      pnpm-version:
+        description: pnpm version when package.json has no packageManager field (e.g. "10.20.0").
+        type: string
+        default: ""
       install-command:
         description: Install command. "auto" runs `npm ci` or `pnpm install --frozen-lockfile` when a lockfile exists, else skips. "" skips.
         type: string
@@ -64,7 +68,7 @@ permissions:
 
 env:
   # design-floor/ at this commit holds the checker (check.mjs 1.0.3); see design-floor/SOURCE.md.
-  FLOOR_REF: c8b3de3ea6b1cadaca25491425329e9f9c843a5f
+  FLOOR_REF: a22197f7eacbe6606ca8bf9b2556ede31c411302
 
 jobs:
   floor:
@@ -107,6 +111,7 @@ jobs:
         if: steps.pm.outputs.manager == 'pnpm'
         uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
         with:
+          version: ${{ inputs.pnpm-version }}
           package_json_file: ${{ inputs.working-directory }}/package.json
 
       - name: Set up Node.js
