@@ -122,6 +122,20 @@ jobs:
           cache: ${{ steps.pm.outputs.manager != 'none' && steps.pm.outputs.manager || '' }}
           cache-dependency-path: ${{ inputs.working-directory }}/${{ steps.pm.outputs.lockfile }}
 
+      - name: Install dependencies
+        if: inputs.install-command != ''
+        env:
+          CMD: ${{ inputs.install-command }}
+          PM: ${{ steps.pm.outputs.manager }}
+        run: |
+          if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
+          case "$PM" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            npm) npm ci ;;
+            *) echo "No lockfile; install skipped." ;;
+          esac
+
+      # After install, so a flag such as NODE_ENV never changes what npm ci installs.
       - name: Build environment
         if: inputs.build-env != ''
         env:
@@ -136,19 +150,6 @@ jobs:
             fi
             echo "$line" >> "$GITHUB_ENV"
           done <<< "$BUILD_ENV"
-
-      - name: Install dependencies
-        if: inputs.install-command != ''
-        env:
-          CMD: ${{ inputs.install-command }}
-          PM: ${{ steps.pm.outputs.manager }}
-        run: |
-          if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
-          case "$PM" in
-            pnpm) pnpm install --frozen-lockfile ;;
-            npm) npm ci ;;
-            *) echo "No lockfile; install skipped." ;;
-          esac
 
       - name: Build
         if: inputs.build-command != ''
