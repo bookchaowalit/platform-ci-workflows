@@ -1,0 +1,196 @@
+# Reusable ADR-0007 design floor check: builds the app, then runs the vendored checker
+# (design-floor/, pinned by FLOOR_REF) against the caller's design-floor.json.
+#
+# Caller example (public repo, Next.js served by `next start` from design-floor.json):
+#   jobs:
+#     design-floor:
+#       uses: bookchaowalit/platform-ci-workflows/.github/workflows/design-floor.yml@<sha> # v1.4.0
+#       with:
+#         build-command: npm run build
+#
+# The report (JSON) and the screenshots at every width are uploaded as an artifact.
+# Private repos pass runner: '["self-hosted","linux","x64","railway"]' and
+# install-browser-deps: false once the runner image carries Chromium's libraries.
+name: design-floor
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON runs-on value. '"ubuntu-24.04"' (pinned image) for public repos, '["self-hosted","linux","x64","railway"]' for private.
+        type: string
+        default: '"ubuntu-24.04"'
+      working-directory:
+        description: Directory that holds the app and its design-floor.json.
+        type: string
+        default: "."
+      config:
+        description: Floor config, relative to working-directory.
+        type: string
+        default: design-floor.json
+      node-version:
+        description: Node.js version. Ignored when node-version-file is set.
+        type: string
+        default: "22"
+      node-version-file:
+        description: File with the Node.js version (.nvmrc, .node-version, package.json), relative to the repo root.
+        type: string
+        default: ""
+      install-command:
+        description: Install command. "auto" runs `npm ci` or `pnpm install --frozen-lockfile` when a lockfile exists, else skips. "" skips.
+        type: string
+        default: auto
+      build-command:
+        description: Build command run before the check, e.g. "npm run build". "" skips (static files already committed, or target.url).
+        type: string
+        default: ""
+      build-env:
+        description: >-
+          Extra environment for the build and the check, one KEY=value per line. Public values only
+          (for example NEXT_PUBLIC_ANALYTICS_ENABLED=true so a consent banner renders as it does in
+          production); never secrets.
+        type: string
+        default: ""
+      install-browser-deps:
+        description: Install Chromium's system libraries with `playwright install --with-deps` (needs sudo; GitHub-hosted runners).
+        type: boolean
+        default: true
+      timeout-minutes:
+        type: number
+        default: 15
+
+permissions:
+  contents: read
+
+env:
+  # design-floor/ at this commit holds the checker (check.mjs 1.0.2); see design-floor/SOURCE.md.
+  FLOOR_REF: 846032a5ca98de39ba902a8707124983dafc9409
+
+jobs:
+  floor:
+    name: design floor (${{ inputs.working-directory }})
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout the checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bookchaowalit/platform-ci-workflows
+          ref: ${{ env.FLOOR_REF }}
+          path: .design-floor-checker
+          sparse-checkout: design-floor
+          persist-credentials: false
+
+      - name: Detect package manager
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+            echo "lockfile=pnpm-lock.yaml" >> "$GITHUB_OUTPUT"
+          elif [ -f package-lock.json ]; then
+            echo "manager=npm" >> "$GITHUB_OUTPUT"
+            echo "lockfile=package-lock.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "manager=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up pnpm
+        if: steps.pm.outputs.manager == 'pnpm'
+        uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: ${{ steps.pm.outputs.manager != 'none' && steps.pm.outputs.manager || '' }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ steps.pm.outputs.lockfile }}
+
+      - name: Build environment
+        if: inputs.build-env != ''
+        env:
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: |
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            [ -z "$line" ] && continue
+            if ! [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+              echo "::error::build-env line is not KEY=value: ${line%%=*}"
+              exit 1
+            fi
+            echo "$line" >> "$GITHUB_ENV"
+          done <<< "$BUILD_ENV"
+
+      - name: Install dependencies
+        if: inputs.install-command != ''
+        env:
+          CMD: ${{ inputs.install-command }}
+          PM: ${{ steps.pm.outputs.manager }}
+        run: |
+          if [ "$CMD" != auto ]; then eval "$CMD"; exit; fi
+          case "$PM" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            npm) npm ci ;;
+            *) echo "No lockfile; install skipped." ;;
+          esac
+
+      - name: Build
+        if: inputs.build-command != ''
+        env:
+          CMD: ${{ inputs.build-command }}
+        run: eval "$CMD"
+
+      - name: Install the checker and Chromium
+        working-directory: .design-floor-checker/design-floor
+        env:
+          WITH_DEPS: ${{ inputs.install-browser-deps }}
+        run: |
+          npm ci --omit=dev --no-audit --no-fund
+          if [ "$WITH_DEPS" = true ]; then
+            npx playwright install --with-deps chromium
+          else
+            npx playwright install chromium
+          fi
+
+      - name: Design floor check
+        id: check
+        env:
+          CONFIG: ${{ inputs.config }}
+          WD: ${{ inputs.working-directory }}
+        run: |
+          out="$RUNNER_TEMP/design-floor"
+          mkdir -p "$out"
+          slug=$(printf '%s' "$WD" | tr -c 'A-Za-z0-9' '-' | tr -s '-' | sed 's/^-//; s/-$//')
+          echo "artifact=design-floor-${slug:-root}" >> "$GITHUB_OUTPUT"
+          checker="$GITHUB_WORKSPACE/.design-floor-checker/design-floor/check.mjs"
+          set +e
+          node "$checker" --config "$CONFIG" --json "$out/report.json" --shots "$out/shots" | tee "$out/output.txt"
+          code=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "### Design floor (ADR-0007): $([ "$code" = 0 ] && echo pass || echo FAIL)"
+            echo '```'
+            cat "$out/output.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+
+      - name: Upload report and screenshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.check.outputs.artifact || 'design-floor' }}
+          path: ${{ runner.temp }}/design-floor
+          if-no-files-found: ignore
+          retention-days: 14

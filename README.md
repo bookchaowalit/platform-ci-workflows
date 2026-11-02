@@ -11,6 +11,7 @@ get no CI/CD.
 | [`security.yml`](.github/workflows/security.yml) | Gitleaks, Semgrep CE, OSV-Scanner, Trivy fs (vuln + IaC misconfig) |
 | [`deploy-railway.yml`](.github/workflows/deploy-railway.yml) | CD after CI passes on `main`: `mode: verify` (v1.3.0) waits for the deployment Railway makes itself and checks it, read-only; `mode: deploy` (v1.2.0) asks Railway to deploy that exact commit. Both smoke-test (health + commit) and fail loudly with a rollback command |
 | [`deploy-vercel.yml`](.github/workflows/deploy-vercel.yml) | The same for a Vercel project, through the REST API with `gitSource` at the commit SHA (no CLI, no upload). Not adopted yet: needs the owner's OK under D9 |
+| [`design-floor.yml`](.github/workflows/design-floor.yml) | ADR-0007 design floor: builds the app, then runs the pinned checker (WCAG 2.2 AA floor, Thai typography, five widths) against its `design-floor.json`; report and screenshots as an artifact. Opt-in (v1.4.0) |
 
 Everything runs as pinned binaries or pinned packages, without Docker, so the same workflows
 run on GitHub-hosted runners and on the Railway self-hosted runner.
@@ -121,6 +122,34 @@ Suppress a finding only with a written reason, in the repository's own file:
 `.gitleaksignore` (fingerprint), `# nosemgrep: <rule-id>` + reason, `osv-scanner.toml`
 (`[[IgnoredVulns]]` with `reason` and `ignoreUntil`), `.trivyignore.yaml` (with `statement`).
 
+## Design floor
+
+Opt-in for user-facing apps that adopted the floor (ADR-0007 in `architecture-docs`, adoption
+steps in `architecture-docs/design-floor/README.md`). The app keeps its `design-floor.json`; the
+job installs, builds, and runs the checker vendored in [`design-floor/`](design-floor/SOURCE.md)
+at the commit pinned by `FLOOR_REF`.
+
+```yaml
+  design-floor:
+    uses: bookchaowalit/platform-ci-workflows/.github/workflows/design-floor.yml@<sha> # v1.4.0
+    with:
+      build-command: npm run build
+      # Optional: render what production renders, e.g. a consent banner behind a public flag.
+      build-env: |
+        NEXT_PUBLIC_ANALYTICS_ENABLED=true
+        NEXT_PUBLIC_POSTHOG_KEY=phc_ci_placeholder
+```
+
+- `target.serve` in `design-floor.json` (for example `["npx", "next", "start", "-p", "4320"]`)
+  runs after the build; `target.static` serves a built folder; `target.url` checks a deployed URL.
+- `build-env` takes public values only. It exists because widgets that render only in production
+  (banners behind a flag) are the usual cause of a floor that passes in CI and fails live.
+- Still run the check against the deployed URL after a deploy (`target.url`): CI cannot see the
+  edge, real environment variables or third-party widgets.
+- Private repositories: the Railway runner image does not carry Chromium's libraries yet, so
+  they keep the local report (ADR-0007 D-9) until it does; then pass the Railway `runner` and
+  `install-browser-deps: false`.
+
 ## Deploy (CD)
 
 Owner decision D3 (2026-10-23, ADR-0003): production deploys start from Git after CI passes,
@@ -188,7 +217,7 @@ off until the owner turns it on. The runner needs `curl` and `jq` (GitHub-hosted
 - Every action is pinned by SHA. Security binaries are pinned by version **and** SHA-256. After
   Renovate bumps a `*_VERSION`, run `scripts/tool-checksums.sh` and paste the new `*_SHA256`.
 - [`self-test.yml`](.github/workflows/self-test.yml) runs actionlint, shellcheck and the security
-  scan on this repository, calls `ci-node` / `ci-python` on the fixtures in `tests/fixtures/`, and
+  scan on this repository, calls `ci-node` / `ci-python` / `design-floor` on the fixtures in `tests/fixtures/`, and
   runs [`tests/gates_test.py`](tests/gates_test.py), which executes the gate and Test step scripts
   against crafted inputs to prove the failure paths (below threshold, missing or stale data,
   zero lines, invalid thresholds, `require-tests`), and [`tests/deploy_test.py`](tests/deploy_test.py),

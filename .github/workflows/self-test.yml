@@ -112,5 +112,12 @@ jobs:
       typecheck-command: ""
       coverage-threshold: "80"
 
+  design-floor:
+    # Runs the pinned checker against a static page that meets the floor (tests/fixtures/design-floor).
+    # The checker's failure paths are tested where it lives, in architecture-docs/design-floor.
+    uses: ./.github/workflows/design-floor.yml
+    with:
+      working-directory: tests/fixtures/design-floor
+
   security:
     uses: ./.github/workflows/security.yml
