@@ -1,0 +1,464 @@
+#!/usr/bin/env node
+// ADR-0007 design floor check. Runs the automated and keyboard-script rows of
+// FLOOR.md against one app, configured by its design-floor.json.
+//
+//   node check.mjs --config path/to/design-floor.json [--json report.json]
+//                  [--shots dir] [--today YYYY-MM-DD]
+//
+// Exit 0: no unwaived failures. Exit 1: failures. Exit 2: config or run error.
+// A pass is not a WCAG 2.2 AA conformance claim (see FLOOR.md).
+
+import { createServer } from "node:http";
+import { spawn } from "node:child_process";
+import { readFile, stat, mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { chromium } from "playwright";
+import { AxeBuilder } from "@axe-core/playwright";
+
+export const FLOOR_VERSION = "1.0.0";
+export const DEFAULT_WIDTHS = [320, 375, 390, 768, 1440];
+export const RULES = [
+  "contrast", "axe", "thai-font", "thai-typography", "lang", "reflow",
+  "target-size", "skip-link", "focus-visible", "focus-not-obscured",
+  "keyboard-trap", "reduced-motion",
+];
+export const NOT_WAIVABLE_ON_PUBLIC = new Set([
+  "contrast", "skip-link", "focus-visible", "focus-not-obscured", "keyboard-trap",
+]);
+const MANUAL_ROWS = ["contrast over images/gradients", "meaningful names", "lang of Latin passages", "states", "keyboard-operable"];
+const AXE_LANG_RULES = new Set(["html-has-lang", "html-lang-valid", "html-xml-lang-mismatch", "valid-lang"]);
+const AXE_TAGS =["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
+const HEIGHT = 900;
+const MAX_TAB_STOPS = 40;
+const MOTION_LIMIT_MS = 200;
+
+const MIME = {
+  ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript",
+  ".mjs": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml",
+  ".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp",
+  ".woff2": "font/woff2", ".woff": "font/woff", ".ico": "image/x-icon", ".txt": "text/plain",
+};
+
+// ---------- config ----------
+
+export async function loadConfig(file) {
+  const raw = JSON.parse(await readFile(file, "utf8"));
+  const errors = [];
+  const t = raw.target ?? {};
+  const kinds = ["static", "serve", "url"].filter((k) => k in t);
+  if (kinds.length === 0) errors.push("target needs one of: static, serve (+url), url");
+  if (t.static && t.serve) errors.push("target.static and target.serve are exclusive");
+  if (t.serve && !t.url) errors.push("target.serve needs target.url");
+  // argv array, run without a shell, so the config cannot smuggle shell syntax.
+  if (t.serve && !(Array.isArray(t.serve) && t.serve.length > 0 && t.serve.every((a) => typeof a === "string" && a))) {
+    errors.push('target.serve must be a non-empty argv array, e.g. ["npm", "run", "start"]');
+  }
+  if (!Array.isArray(raw.routes) || raw.routes.length === 0) errors.push("routes must be a non-empty array");
+  // A route is a path, or { path, status } for a page that must answer with
+  // that status, such as the not-found page: { "path": "/no-such-page/", "status": 404 }.
+  for (const [i, r] of (Array.isArray(raw.routes) ? raw.routes : []).entries()) {
+    const ok = typeof r === "string" ? r.startsWith("/")
+      : typeof r?.path === "string" && r.path.startsWith("/") && Number.isInteger(r.status) && r.status >= 200 && r.status < 600;
+    if (!ok) errors.push(`routes[${i}] must be a path starting with / or { "path": "/x", "status": 404 }`);
+  }
+  const widths = raw.widths ?? DEFAULT_WIDTHS;
+  for (const w of DEFAULT_WIDTHS) if (!widths.includes(w)) errors.push(`widths must include ${w}`);
+  for (const [i, w] of (raw.waivers ?? []).entries()) {
+    if (!RULES.includes(w.rule)) errors.push(`waivers[${i}].rule unknown: ${w.rule}`);
+    if (!w.reason) errors.push(`waivers[${i}].reason is required`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(w.expires ?? "")) errors.push(`waivers[${i}].expires must be YYYY-MM-DD`);
+  }
+  if (errors.length) throw new Error(`${file}: ${errors.join("; ")}`);
+  return {
+    floor: raw.floor ?? FLOOR_VERSION,
+    public: raw.public ?? true,
+    target: t,
+    routes: raw.routes.map((r) => (typeof r === "string" ? { path: r, status: null } : { path: r.path, status: r.status })),
+    widths,
+    waivers: raw.waivers ?? [],
+    baseDir: path.dirname(path.resolve(file)),
+  };
+}
+
+// ---------- target ----------
+
+function staticServer(root) {
+  const server = createServer(async (req, res) => {
+    try {
+      let p = decodeURIComponent(new URL(req.url, "http://x").pathname);
+      let file = path.join(root, p);
+      if (!file.startsWith(root)) throw new Error("outside root");
+      let s = await stat(file).catch(() => null);
+      if (s?.isDirectory()) { file = path.join(file, "index.html"); s = await stat(file).catch(() => null); }
+      if (!s && !path.extname(file)) { file += ".html"; s = await stat(file).catch(() => null); }
+      if (!s) {
+        // Like static hosts (Vercel, Netlify, Pages): a miss gets 404.html with status 404.
+        const notFound = await readFile(path.join(root, "404.html")).catch(() => null);
+        if (notFound) res.writeHead(404, { "content-type": MIME[".html"] }).end(notFound);
+        else res.writeHead(404).end("not found");
+        return;
+      }
+      res.writeHead(200, { "content-type": MIME[path.extname(file)] ?? "application/octet-stream" });
+      res.end(await readFile(file));
+    } catch {
+      res.writeHead(400).end("bad request");
+    }
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve({
+      url: `http://127.0.0.1:${server.address().port}`,
+      stop: () => new Promise((r) => server.close(r)),
+    }));
+  });
+}
+
+async function waitFor(url, ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    try { const r = await fetch(url); if (r.status < 500) return; } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`target did not answer at ${url} within ${ms / 1000}s`);
+}
+
+export async function startTarget(cfg) {
+  const t = cfg.target;
+  if (t.static) return staticServer(path.resolve(cfg.baseDir, t.static));
+  if (t.serve) {
+    const [cmd, ...cmdArgs] = t.serve;
+    const child = spawn(cmd, cmdArgs, { cwd: cfg.baseDir, shell: false, stdio: "ignore", detached: true });
+    try {
+      await waitFor(t.url, (t.timeoutSeconds ?? 120) * 1000);
+    } catch (e) {
+      process.kill(-child.pid, "SIGTERM");
+      throw e;
+    }
+    return { url: t.url, stop: async () => { try { process.kill(-child.pid, "SIGTERM"); } catch { /* gone */ } } };
+  }
+  return { url: t.url, stop: async () => {} };
+}
+
+// ---------- in-page probes (run in the browser) ----------
+
+const THAI = "[\\u0E00-\\u0E7F]";
+
+function probeTypography(thaiPattern) {
+  const thai = new RegExp(thaiPattern);
+  const out = { thaiElements: 0, langMissing: !document.documentElement.getAttribute("lang"), typo: [], lang: [] };
+  const faces = [...document.fonts].filter((f) => f.status === "loaded").map((f) => f.family.replace(/["']/g, ""));
+  const isNotoThai = (s) => /noto[\s_-]*(sans|serif)[\s_-]*thai/i.test(s);
+  out.loadedThaiFace = faces.some(isNotoThai);
+  const describe = (el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.className && typeof el.className === "string" ? "." + el.className.trim().split(/\s+/).join(".") : "");
+  for (const el of document.body.querySelectorAll("*")) {
+    const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
+    if (!thai.test(own)) continue;
+    const cs = getComputedStyle(el);
+    if (cs.display === "none" || cs.visibility === "hidden") continue;
+    if (out.thaiElements < 30) el.setAttribute("data-design-floor-thai", describe(el));
+    out.thaiElements++;
+    // Leading matters where Thai lines stack: only non-inline boxes that wrap to
+    // two or more lines (inline boxes inherit the line box of their block).
+    const size = parseFloat(cs.fontSize);
+    const lh = cs.lineHeight === "normal" ? 1.2 : parseFloat(cs.lineHeight) / size;
+    const heading = /^H[1-6]$/.test(el.tagName) || size >= 24;
+    const min = heading ? 1.3 : 1.6;
+    if (lh + 1e-6 < min && cs.display !== "inline") {
+      // Count text lines from the element's text nodes only (icons and
+      // badges inside an inline-flex row are not lines), clustering line
+      // boxes whose tops are closer than half a line apart.
+      const lhPx = lh * size;
+      const tops = [];
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        if (!n.textContent.trim()) continue;
+        const range = document.createRange();
+        range.selectNodeContents(n);
+        for (const r of range.getClientRects()) if (r.width > 0) tops.push(r.top);
+      }
+      tops.sort((a, b) => a - b);
+      let lines = 0;
+      let last = -Infinity;
+      for (const t of tops) if (t - last > lhPx / 2) { lines++; last = t; }
+      if (lines >= 2) out.typo.push({ el: describe(el), detail: `line-height ${lh.toFixed(2)} < ${min} (${heading ? "heading" : "body"}, ${lines} lines)` });
+    }
+    const ls = cs.letterSpacing === "normal" ? 0 : parseFloat(cs.letterSpacing);
+    if (ls < 0) out.typo.push({ el: describe(el), detail: `letter-spacing ${cs.letterSpacing} is negative` });
+    const ctx = el.closest("[lang]")?.getAttribute("lang") ?? "";
+    if (!/^th\b/i.test(ctx)) out.lang.push({ el: describe(el), detail: `Thai text in lang="${ctx}" context` });
+  }
+  return out;
+}
+
+function probeTargets() {
+  const sel = 'a[href], button, input:not([type=hidden]), select, textarea, summary, [role=button], [role=link], [tabindex]:not([tabindex="-1"])';
+  const bad = [];
+  const describe = (el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "");
+  for (const el of document.querySelectorAll(sel)) {
+    const cs = getComputedStyle(el);
+    if (cs.display === "none" || cs.visibility === "hidden") continue;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 1 && r.height <= 1) continue; // not shown (e.g. sr-only skip link before focus)
+    if (r.width >= 24 && r.height >= 24) continue;
+    if (el.tagName === "A" && cs.display === "inline") {
+      const parentText = (el.parentElement?.textContent ?? "").trim();
+      if (parentText.length > el.textContent.trim().length + 10) continue; // inline exception
+    }
+    bad.push({ el: describe(el), detail: `${Math.round(r.width)}×${Math.round(r.height)} px` });
+  }
+  return bad;
+}
+
+function probeFocus() {
+  const el = document.activeElement;
+  if (!el || el === document.body) return null;
+  const cs = getComputedStyle(el);
+  const ring = (cs.outlineStyle !== "none" && parseFloat(cs.outlineWidth) > 0) || (cs.boxShadow && cs.boxShadow !== "none");
+  const r = el.getBoundingClientRect();
+  const pts = [[0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]].map(([x, y]) => [r.left + r.width * x, r.top + r.height * y]);
+  const covered = pts.every(([x, y]) => {
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return false;
+    const hit = document.elementFromPoint(x, y);
+    return hit && hit !== el && !el.contains(hit) && !hit.contains(el);
+  });
+  // A skip link points at the main content: <main>/[role=main] itself, an
+  // element that wraps it, or the first heading or first child inside it.
+  const href = el.getAttribute("href") ?? "";
+  let skipTarget = false;
+  if (href.startsWith("#") && href.length > 1) {
+    const t = document.getElementById(decodeURIComponent(href.slice(1)));
+    const main = document.querySelector("main, [role=main]");
+    skipTarget = !!(t && main && (t === main || t.contains(main) || t === main.firstElementChild || t === main.querySelector("h1")));
+  }
+  const key = el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + `@${Math.round(r.left)},${Math.round(r.top + scrollY)}`;
+  return { key, ring, covered, isSkip: el.tagName === "A" && skipTarget, label: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "") };
+}
+
+// WCAG 2.3.3 covers motion: movement, scaling, rotation, size. Fades and
+// colour changes are not motion, so animations that only touch those pass.
+const NON_MOTION = /^(opacity|color|background-color|border-color|outline-color|fill|stroke|visibility|offset|easing|composite|computedOffset)$/i;
+function probeMotion({ limit, nonMotion }) {
+  const quiet = new RegExp(nonMotion, "i");
+  return document.getAnimations()
+    .filter((a) => a.playState === "running")
+    .filter((a) => {
+      const frames = a.effect?.getKeyframes?.() ?? [];
+      const props = new Set(frames.flatMap((f) => Object.keys(f)));
+      if (a.transitionProperty) props.add(a.transitionProperty);
+      return [...props].some((p) => !quiet.test(p));
+    })
+    .map((a) => {
+      const t = a.effect?.getComputedTiming?.() ?? {};
+      const target = a.effect?.target;
+      return { name: a.animationName ?? a.transitionProperty ?? a.constructor.name, duration: t.duration, iterations: t.iterations, el: target ? target.tagName.toLowerCase() + (target.id ? `#${target.id}` : "") : "?" };
+    })
+    .filter((a) => a.iterations === Infinity || (typeof a.duration === "number" && a.duration > limit));
+}
+
+// Entrance animations (fades, slides) are measured mid-flight otherwise: axe
+// then reports contrast of half-transparent text. Wait for finite ones.
+// Scroll-triggered entrances (whileInView, IntersectionObserver) keep
+// below-the-fold content transparent, and axe skips transparent text. Scroll
+// the page through once so everything is revealed, then return to the top.
+async function revealAll(page) {
+  await page.evaluate(async () => {
+    const step = Math.max(200, Math.floor(innerHeight * 0.8));
+    for (let y = 0; y < document.documentElement.scrollHeight; y += step) {
+      scrollTo(0, y);
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    scrollTo(0, 0);
+  });
+}
+
+// JS-driven animation (framer-motion, GSAP) is invisible to getAnimations(),
+// so also wait until opacity and transforms stop changing.
+async function settleAnimations(page, ms = 3000) {
+  await page.evaluate((limit) => Promise.race([
+    Promise.all(document.getAnimations()
+      .filter((a) => a.effect?.getComputedTiming?.().iterations !== Infinity)
+      .map((a) => a.finished.catch(() => {}))),
+    new Promise((r) => setTimeout(r, limit)),
+  ]), ms);
+  await page.evaluate(async (limit) => {
+    const snap = () => [...document.body.querySelectorAll("*")].slice(0, 3000)
+      .map((el) => { const c = getComputedStyle(el); return c.opacity + c.transform; }).join("|");
+    const end = Date.now() + limit;
+    let prev = snap();
+    while (Date.now() < end) {
+      await new Promise((r) => setTimeout(r, 250));
+      const next = snap();
+      if (next === prev) return;
+      prev = next;
+    }
+  }, ms);
+}
+
+// Asks Chromium which fonts actually drew each tagged Thai element. Latin-first
+// stacks ("Inter", "Noto Sans Thai", …) pass because Noto draws the Thai glyphs.
+async function renderedThaiFonts(page) {
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await cdp.send("DOM.enable");
+    await cdp.send("CSS.enable");
+    const { root } = await cdp.send("DOM.getDocument", { depth: -1 });
+    const { nodeIds } = await cdp.send("DOM.querySelectorAll", { nodeId: root.nodeId, selector: "[data-design-floor-thai]" });
+    const bad = [];
+    for (const nodeId of nodeIds) {
+      const { attributes } = await cdp.send("DOM.getAttributes", { nodeId });
+      const label = attributes[attributes.indexOf("data-design-floor-thai") + 1];
+      const { fonts } = await cdp.send("CSS.getPlatformFontsForNode", { nodeId });
+      if (!fonts.some((f) => f.glyphCount > 0)) continue; // nothing painted (hidden or clipped)
+      if (!fonts.some((f) => /noto\s*(sans|serif)\s*thai/i.test(f.familyName) && f.glyphCount > 0)) {
+        bad.push({ el: label, detail: `rendered with ${fonts.map((f) => f.familyName).join(", ") || "no font"}` });
+      }
+    }
+    return bad;
+  } finally {
+    await cdp.detach();
+  }
+}
+
+// ---------- run ----------
+
+function finding(rule, route, width, el, detail) { return { rule, route, width, el, detail }; }
+
+export async function runChecks(cfg, { shots } = {}) {
+  const target = await startTarget(cfg);
+  const browser = await chromium.launch();
+  const findings = [];
+  try {
+    for (const { path: route, status: expected } of cfg.routes) {
+      const url = new URL(route, target.url).href;
+
+      for (const width of cfg.widths) {
+        const ctx = await browser.newContext({ viewport: { width, height: HEIGHT } });
+        const page = await ctx.newPage();
+        const resp = await page.goto(url, { waitUntil: "load" });
+        const got = resp?.status();
+        if (!resp || (expected ? got !== expected : got >= 400)) throw new Error(`${url} returned ${got}${expected ? `, expected ${expected}` : ""}`);
+        await page.evaluate(() => document.fonts.ready);
+        await revealAll(page);
+        await settleAnimations(page);
+
+        const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+        if (overflow > 1) findings.push(finding("reflow", route, width, "html", `horizontal scroll of ${overflow} px`));
+
+        if (width === 390 || width === 1440) {
+          const axe = await new AxeBuilder({ page }).withTags(AXE_TAGS).analyze();
+          for (const v of axe.violations) {
+            const rule = v.id === "color-contrast" ? "contrast" : AXE_LANG_RULES.has(v.id) ? "lang" : "axe";
+            for (const n of v.nodes.slice(0, 5)) findings.push(finding(rule, route, width, n.target.join(" "), `${v.id}: ${v.help}`));
+          }
+        }
+
+        if (width === 390) {
+          const t = await page.evaluate(probeTypography, THAI);
+          if (t.langMissing) findings.push(finding("lang", route, width, "html", "<html> has no lang attribute"));
+          if (t.thaiElements > 0 && !t.loadedThaiFace) findings.push(finding("thai-font", route, width, "document", "no Noto Sans/Serif Thai font face loaded"));
+          for (const f of await renderedThaiFonts(page)) findings.push(finding("thai-font", route, width, f.el, f.detail));
+          for (const f of t.typo) findings.push(finding("thai-typography", route, width, f.el, f.detail));
+          for (const f of t.lang) findings.push(finding("lang", route, width, f.el, f.detail));
+          for (const f of await page.evaluate(probeTargets)) findings.push(finding("target-size", route, width, f.el, f.detail));
+        }
+
+        if (width === 1440) {
+          await page.keyboard.press("Tab");
+          const first = await page.evaluate(probeFocus);
+          if (!first?.isSkip) findings.push(finding("skip-link", route, width, first?.label ?? "(nothing focused)", "first Tab stop is not a skip link to an existing target"));
+          let state = first;
+          const seen = new Set();
+          for (let i = 0; i < MAX_TAB_STOPS && state && !seen.has(state.key); i++) {
+            seen.add(state.key);
+            if (!state.ring) findings.push(finding("focus-visible", route, width, state.label, "no outline or box-shadow while focused"));
+            if (state.covered) findings.push(finding("focus-not-obscured", route, width, state.label, "focused element is fully covered"));
+            let next = null;
+            let stuck = 0;
+            for (; stuck < 3; stuck++) {
+              await page.keyboard.press("Tab");
+              next = await page.evaluate(probeFocus);
+              if (!next || next.key !== state.key) break;
+            }
+            if (stuck === 3) { findings.push(finding("keyboard-trap", route, width, state.label, "focus did not move after 3 Tabs")); break; }
+            state = next; // a key already seen means focus wrapped around: the loop ends
+          }
+        }
+
+        if (shots) {
+          await mkdir(shots, { recursive: true });
+          const name = `${route.replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "") || "root"}-${width}.png`;
+          await page.screenshot({ path: path.join(shots, name), fullPage: true });
+        }
+        await ctx.close();
+      }
+
+      const ctx = await browser.newContext({ viewport: { width: 390, height: HEIGHT }, reducedMotion: "reduce" });
+      const page = await ctx.newPage();
+      await page.goto(url, { waitUntil: "load" });
+      await page.waitForTimeout(300);
+      for (const a of await page.evaluate(probeMotion, { limit: MOTION_LIMIT_MS, nonMotion: NON_MOTION.source })) {
+        findings.push(finding("reduced-motion", route, 390, a.el, `${a.name} runs ${a.iterations === Infinity ? "infinitely" : `${Math.round(a.duration)} ms`} under reduced motion`));
+      }
+      await ctx.close();
+    }
+  } finally {
+    await browser.close();
+    await target.stop();
+  }
+  return findings;
+}
+
+export function applyWaivers(cfg, findings, today) {
+  const problems = [];
+  const active = [];
+  for (const w of cfg.waivers) {
+    if (cfg.public && NOT_WAIVABLE_ON_PUBLIC.has(w.rule)) { problems.push(`waiver for ${w.rule} not allowed on a public app`); continue; }
+    if (w.expires < today) { problems.push(`waiver for ${w.rule} expired on ${w.expires}`); continue; }
+    active.push(w);
+  }
+  const covers = (w, f) => w.rule === f.rule && (!w.routes || w.routes.includes(f.route));
+  const failed = [];
+  const waived = [];
+  for (const f of findings) (active.some((w) => covers(w, f)) ? waived : failed).push(f);
+  return { failed, waived, problems };
+}
+
+function summarize(cfg, result) {
+  const lines = [];
+  lines.push(`design floor ${FLOOR_VERSION} — automated part only; not a WCAG 2.2 AA conformance claim.`);
+  lines.push(`manual rows still to sign off in ux-review: ${MANUAL_ROWS.join(", ")}.`);
+  const byRule = new Map(RULES.map((r) => [r, { failed: 0, waived: 0 }]));
+  for (const f of result.failed) byRule.get(f.rule).failed++;
+  for (const f of result.waived) byRule.get(f.rule).waived++;
+  for (const [rule, c] of byRule) lines.push(`  ${c.failed ? "FAIL" : c.waived ? "WAIVED" : "PASS"}  ${rule}${c.failed ? ` (${c.failed})` : ""}${c.waived ? ` [${c.waived} waived]` : ""}`);
+  for (const p of result.problems) lines.push(`  FAIL  waiver: ${p}`);
+  for (const f of result.failed.slice(0, 50)) lines.push(`    - ${f.rule} ${f.route} @${f.width}: ${f.el} — ${f.detail}`);
+  if (result.failed.length > 50) lines.push(`    … ${result.failed.length - 50} more in the JSON report`);
+  return lines.join("\n");
+}
+
+async function main(argv) {
+  const args = { config: "design-floor.json" };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--config") args.config = argv[++i];
+    else if (a === "--json") args.json = argv[++i];
+    else if (a === "--shots") args.shots = argv[++i];
+    else if (a === "--today") args.today = argv[++i];
+    else { console.error(`unknown argument ${a}`); return 2; }
+  }
+  let cfg;
+  try { cfg = await loadConfig(args.config); } catch (e) { console.error(`config error: ${e.message}`); return 2; }
+  const today = args.today ?? new Date().toISOString().slice(0, 10);
+  let findings;
+  try { findings = await runChecks(cfg, { shots: args.shots }); } catch (e) { console.error(`run error: ${e.message}`); return 2; }
+  const result = applyWaivers(cfg, findings, today);
+  console.log(summarize(cfg, result));
+  if (args.json) {
+    await writeFile(args.json, JSON.stringify({ floor: FLOOR_VERSION, date: today, conformanceClaim: false, manualRows: MANUAL_ROWS, ...result }, null, 2));
+  }
+  return result.failed.length || result.problems.length ? 1 : 0;
+}
+
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("check.mjs")) {
+  main(process.argv.slice(2)).then((code) => process.exit(code));
+}
