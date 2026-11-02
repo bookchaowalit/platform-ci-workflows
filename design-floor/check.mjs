@@ -152,9 +152,11 @@ function probeTypography() {
     const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
     if (!thai.test(own)) continue;
     const cs = getComputedStyle(el);
-    // checkVisibility also covers a display:none ancestor; a display:contents box has none of its own.
-    const box = cs.display === "contents" ? el.parentElement : el;
-    if (!box?.checkVisibility({ visibilityProperty: true })) continue;
+    // checkVisibility also covers a display:none ancestor. display:contents elements have no box
+    // of their own, so ask the nearest ancestor that has one (or skip if the element itself is hidden).
+    let box = el;
+    while (box && getComputedStyle(box).display === "contents") box = box.parentElement;
+    if (cs.visibility === "hidden" || !(box ?? document.body).checkVisibility({ visibilityProperty: true })) continue;
     if (out.thaiElements < 30) el.setAttribute("data-design-floor-thai", describe(el));
     out.thaiElements++;
     // Leading matters where Thai lines stack: only non-inline boxes that wrap to
