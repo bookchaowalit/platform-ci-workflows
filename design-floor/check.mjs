@@ -140,10 +140,9 @@ export async function startTarget(cfg) {
 
 // ---------- in-page probes (run in the browser) ----------
 
-const THAI = "[\\u0E00-\\u0E7F]";
-
-function probeTypography(thaiPattern) {
-  const thai = new RegExp(thaiPattern);
+// Probes are serialised into the page, so their patterns are literals inside them.
+function probeTypography() {
+  const thai = /[\u0E00-\u0E7F]/;
   const out = { thaiElements: 0, langMissing: !document.documentElement.getAttribute("lang"), typo: [], lang: [] };
   const faces = [...document.fonts].filter((f) => f.status === "loaded").map((f) => f.family.replace(/["']/g, ""));
   const isNotoThai = (s) => /noto[\s_-]*(sans|serif)[\s_-]*thai/i.test(s);
@@ -235,9 +234,8 @@ function probeFocus() {
 
 // WCAG 2.3.3 covers motion: movement, scaling, rotation, size. Fades and
 // colour changes are not motion, so animations that only touch those pass.
-const NON_MOTION = /^(opacity|color|background-color|border-color|outline-color|fill|stroke|visibility|offset|easing|composite|computedOffset)$/i;
-function probeMotion({ limit, nonMotion }) {
-  const quiet = new RegExp(nonMotion, "i");
+function probeMotion({ limit }) {
+  const quiet = /^(opacity|color|background-color|border-color|outline-color|fill|stroke|visibility|offset|easing|composite|computedOffset)$/i;
   return document.getAnimations()
     .filter((a) => a.playState === "running")
     .filter((a) => {
@@ -352,7 +350,7 @@ export async function runChecks(cfg, { shots } = {}) {
         }
 
         if (width === 390) {
-          const t = await page.evaluate(probeTypography, THAI);
+          const t = await page.evaluate(probeTypography);
           if (t.langMissing) findings.push(finding("lang", route, width, "html", "<html> has no lang attribute"));
           if (t.thaiElements > 0 && !t.loadedThaiFace) findings.push(finding("thai-font", route, width, "document", "no Noto Sans/Serif Thai font face loaded"));
           for (const f of await renderedThaiFonts(page)) findings.push(finding("thai-font", route, width, f.el, f.detail));
@@ -395,7 +393,7 @@ export async function runChecks(cfg, { shots } = {}) {
       const page = await ctx.newPage();
       await page.goto(url, { waitUntil: "load" });
       await page.waitForTimeout(300);
-      for (const a of await page.evaluate(probeMotion, { limit: MOTION_LIMIT_MS, nonMotion: NON_MOTION.source })) {
+      for (const a of await page.evaluate(probeMotion, { limit: MOTION_LIMIT_MS })) {
         findings.push(finding("reduced-motion", route, 390, a.el, `${a.name} runs ${a.iterations === Infinity ? "infinitely" : `${Math.round(a.duration)} ms`} under reduced motion`));
       }
       await ctx.close();
