@@ -7,7 +7,7 @@ public reusable workflow cannot check out a private repository.
 
 | File | From | SHA-256 |
 |---|---|---|
-| `check.mjs` (1.0.3) | `architecture-docs` @ `0cafec3` (branch `fix/check-regex-literals`) | `be23a10fbe9b8f6051e96c2fe33dfca98d874e71cd0c87444dc01314b95f715f` |
+| `check.mjs` (1.0.3) | `architecture-docs` @ `b4f6320` | `f2037ddc3b1090e8b7e5b2a44fa7372867ade1acb9370639a533af4126409d35` |
 | `package.json` | `architecture-docs` @ `1cffc68`, unchanged since | `7cafdae8d59300cf81a50a25a7a4aa01433cdea5763277f8d7d9cc3152c8d90d` |
 | `package-lock.json` | `architecture-docs` @ `1cffc68`, unchanged since | `e63344ded30de8310f49f65e370b93f1e425f02048ce24d01193425d9cf7da25` |
 

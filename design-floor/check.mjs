@@ -152,7 +152,9 @@ function probeTypography() {
     const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
     if (!thai.test(own)) continue;
     const cs = getComputedStyle(el);
-    if (cs.display === "none" || cs.visibility === "hidden") continue;
+    // checkVisibility also covers a display:none ancestor; a display:contents box has none of its own.
+    const box = cs.display === "contents" ? el.parentElement : el;
+    if (!box?.checkVisibility({ visibilityProperty: true })) continue;
     if (out.thaiElements < 30) el.setAttribute("data-design-floor-thai", describe(el));
     out.thaiElements++;
     // Leading matters where Thai lines stack: only non-inline boxes that wrap to
@@ -235,14 +237,17 @@ function probeFocus() {
 // WCAG 2.3.3 covers motion: movement, scaling, rotation, size. Fades and
 // colour changes are not motion, so animations that only touch those pass.
 function probeMotion({ limit }) {
-  const quiet = /^(opacity|color|background-color|border-color|outline-color|fill|stroke|visibility|offset|easing|composite|computedOffset)$/i;
+  // Any *-color property counts as colour: getKeyframes() expands shorthands into longhands
+  // (border-color -> borderTopColor...) and names them in camelCase; transitionProperty is hyphenated.
+  const quiet = /^(opacity|fill|stroke|visibility|offset|easing|composite|computed-offset|([a-z]+-)*color)$/i;
+  const hyphenate = (p) => p.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
   return document.getAnimations()
     .filter((a) => a.playState === "running")
     .filter((a) => {
       const frames = a.effect?.getKeyframes?.() ?? [];
       const props = new Set(frames.flatMap((f) => Object.keys(f)));
       if (a.transitionProperty) props.add(a.transitionProperty);
-      return [...props].some((p) => !quiet.test(p));
+      return [...props].some((p) => !quiet.test(hyphenate(p)));
     })
     .map((a) => {
       const t = a.effect?.getComputedTiming?.() ?? {};
@@ -325,7 +330,7 @@ export async function runChecks(cfg, { shots } = {}) {
   const browser = await chromium.launch();
   const findings = [];
   try {
-    for (const { path: route, status: expected } of cfg.routes) {
+    for (const [index, { path: route, status: expected }] of cfg.routes.entries()) {
       const url = new URL(route, target.url).href;
 
       for (const width of cfg.widths) {
@@ -383,7 +388,9 @@ export async function runChecks(cfg, { shots } = {}) {
 
         if (shots) {
           await mkdir(shots, { recursive: true });
-          const name = `${route.replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "") || "root"}-${width}.png`;
+          // The route's position keeps names unique: "/a-b" and "/a/b" (or Thai paths) share a slug.
+          const slug = route.replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "") || "root";
+          const name = `${String(index + 1).padStart(2, "0")}-${slug}-${width}.png`;
           await page.screenshot({ path: path.join(shots, name), fullPage: true });
         }
         await ctx.close();
