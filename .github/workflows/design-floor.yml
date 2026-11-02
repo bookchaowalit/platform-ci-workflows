@@ -63,8 +63,8 @@ permissions:
   contents: read
 
 env:
-  # design-floor/ at this commit holds the checker (check.mjs 1.0.2); see design-floor/SOURCE.md.
-  FLOOR_REF: 846032a5ca98de39ba902a8707124983dafc9409
+  # design-floor/ at this commit holds the checker (check.mjs 1.0.3); see design-floor/SOURCE.md.
+  FLOOR_REF: 51bf9dd737d6f7809d8519e78c3384aa76b15074
 
 jobs:
   floor:
