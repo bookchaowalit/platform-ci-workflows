@@ -64,7 +64,7 @@ permissions:
 
 env:
   # design-floor/ at this commit holds the checker (check.mjs 1.0.3); see design-floor/SOURCE.md.
-  FLOOR_REF: d4a0c82e178a6cc81d98d0e60124e9ee9b4921ab
+  FLOOR_REF: c8b3de3ea6b1cadaca25491425329e9f9c843a5f
 
 jobs:
   floor:
