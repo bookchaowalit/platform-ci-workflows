@@ -33,6 +33,17 @@ const MAX_TAB_STOPS = 40;
 const MOTION_LIMIT_MS = 200;
 const MAX_SCROLL_STEPS = 60; // an infinite feed keeps growing; stop revealing after this many screens
 
+/** @typedef {{ path: string, status: number | null }} Route */
+/** @typedef {{ rule: string, reason: string, expires: string, routes?: string[] }} Waiver */
+/** @typedef {{ static?: string, serve?: string[], url?: string, timeoutSeconds?: number }} Target */
+/** @typedef {{ floor: string, public: boolean, target: Target, routes: Route[], widths: number[], waivers: Waiver[], baseDir: string }} Config */
+/** @typedef {{ rule: string, route: string, width: number, el: string, detail: string }} Finding */
+/** @typedef {{ failed: Finding[], waived: Finding[], problems: string[] }} Result */
+/** @typedef {{ url: string, stop: () => Promise<void> }} Running */
+/** @typedef {{ el: string, detail: string }} Issue */
+/** @typedef {import("playwright").Page} Page */
+
+/** @type {Record<string, string>} */
 const MIME = {
   ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript",
   ".mjs": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml",
@@ -42,6 +53,10 @@ const MIME = {
 
 // ---------- config ----------
 
+/**
+ * @param {string} file
+ * @returns {Promise<Config>}
+ */
 export async function loadConfig(file) {
   const raw = JSON.parse(await readFile(file, "utf8"));
   const errors = [];
@@ -51,7 +66,7 @@ export async function loadConfig(file) {
   if (t.static && t.serve) errors.push("target.static and target.serve are exclusive");
   if (t.serve && !t.url) errors.push("target.serve needs target.url");
   // argv array, run without a shell, so the config cannot smuggle shell syntax.
-  if (t.serve && !(Array.isArray(t.serve) && t.serve.length > 0 && t.serve.every((a) => typeof a === "string" && a))) {
+  if (t.serve && !(Array.isArray(t.serve) && t.serve.length > 0 && t.serve.every((/** @type {unknown} */ a) => typeof a === "string" && a))) {
     errors.push('target.serve must be a non-empty argv array, e.g. ["npm", "run", "start"]');
   }
   if (!Array.isArray(raw.routes) || raw.routes.length === 0) errors.push("routes must be a non-empty array");
@@ -74,7 +89,7 @@ export async function loadConfig(file) {
     floor: raw.floor ?? FLOOR_VERSION,
     public: raw.public ?? true,
     target: t,
-    routes: raw.routes.map((r) => (typeof r === "string" ? { path: r, status: null } : { path: r.path, status: r.status })),
+    routes: raw.routes.map((/** @type {string | Route} */ r) => (typeof r === "string" ? { path: r, status: null } : { path: r.path, status: r.status })),
     widths,
     waivers: raw.waivers ?? [],
     baseDir: path.dirname(path.resolve(file)),
@@ -83,10 +98,14 @@ export async function loadConfig(file) {
 
 // ---------- target ----------
 
+/**
+ * @param {string} root
+ * @returns {Promise<Running>}
+ */
 function staticServer(root) {
   const server = createServer(async (req, res) => {
     try {
-      let p = decodeURIComponent(new URL(req.url, "http://x").pathname);
+      let p = decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname);
       let file = path.join(root, p);
       if (!file.startsWith(root)) throw new Error("outside root");
       let s = await stat(file).catch(() => null);
@@ -107,12 +126,16 @@ function staticServer(root) {
   });
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve({
-      url: `http://127.0.0.1:${server.address().port}`,
-      stop: () => new Promise((r) => server.close(r)),
+      url: `http://127.0.0.1:${/** @type {import("node:net").AddressInfo} */ (server.address()).port}`,
+      stop: () => new Promise((r) => server.close(() => r(undefined))),
     }));
   });
 }
 
+/**
+ * @param {string} url
+ * @param {number} ms
+ */
 async function waitFor(url, ms) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
@@ -123,21 +146,29 @@ async function waitFor(url, ms) {
   throw new Error(`target did not answer at ${url} within ${ms / 1000}s`);
 }
 
+/**
+ * @param {Config} cfg
+ * @returns {Promise<Running>}
+ */
 export async function startTarget(cfg) {
   const t = cfg.target;
   if (t.static) return staticServer(path.resolve(cfg.baseDir, t.static));
+  // loadConfig guarantees a url with serve, and url when neither static nor serve is set.
+  const url = /** @type {string} */ (t.url);
   if (t.serve) {
     const [cmd, ...cmdArgs] = t.serve;
     const child = spawn(cmd, cmdArgs, { cwd: cfg.baseDir, shell: false, stdio: "ignore", detached: true });
+    // The process group to signal; spawn leaves pid unset only when the command failed to start.
+    const group = -(child.pid ?? 0);
     try {
-      await waitFor(t.url, (t.timeoutSeconds ?? 120) * 1000);
+      await waitFor(url, (t.timeoutSeconds ?? 120) * 1000);
     } catch (e) {
-      try { process.kill(-child.pid, "SIGTERM"); } catch { /* already exited */ }
+      try { if (group) process.kill(group, "SIGTERM"); } catch { /* already exited */ }
       throw e;
     }
-    return { url: t.url, stop: async () => { try { process.kill(-child.pid, "SIGTERM"); } catch { /* gone */ } } };
+    return { url, stop: async () => { try { if (group) process.kill(group, "SIGTERM"); } catch { /* gone */ } } };
   }
-  return { url: t.url, stop: async () => {} };
+  return { url, stop: async () => {} };
 }
 
 // ---------- in-page probes (run in the browser) ----------
@@ -145,11 +176,12 @@ export async function startTarget(cfg) {
 // Probes are serialised into the page, so their patterns are literals inside them.
 function probeTypography() {
   const thai = /[\u0E00-\u0E7F]/;
-  const out = { thaiElements: 0, langMissing: !document.documentElement.getAttribute("lang"), typo: [], lang: [] };
+  /** @type {{ thaiElements: number, langMissing: boolean, loadedThaiFace: boolean, typo: Issue[], lang: Issue[] }} */
+  const out = { thaiElements: 0, langMissing: !document.documentElement.getAttribute("lang"), loadedThaiFace: false, typo: [], lang: [] };
   const faces = [...document.fonts].filter((f) => f.status === "loaded").map((f) => f.family.replace(/["']/g, ""));
-  const isNotoThai = (s) => /noto[\s_-]*(sans|serif)[\s_-]*thai/i.test(s);
+  const isNotoThai = (/** @type {string} */ s) => /noto[\s_-]*(sans|serif)[\s_-]*thai/i.test(s);
   out.loadedThaiFace = faces.some(isNotoThai);
-  const describe = (el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.className && typeof el.className === "string" ? "." + el.className.trim().split(/\s+/).join(".") : "");
+  const describe = (/** @type {Element} */ el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.className && typeof el.className === "string" ? "." + el.className.trim().split(/\s+/).join(".") : "");
   for (const el of document.body.querySelectorAll("*")) {
     const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
     if (!thai.test(own)) continue;
@@ -157,6 +189,7 @@ function probeTypography() {
     // The element's own visibility is authoritative (it inherits, and a child may set it back to
     // visible). checkVisibility() covers a display:none ancestor; display:contents elements have no
     // box of their own, so ask the nearest ancestor that has one.
+    /** @type {Element | null} */
     let box = el;
     while (box && getComputedStyle(box).display === "contents") box = box.parentElement;
     if (cs.visibility !== "visible" || !(box ?? document.body).checkVisibility()) continue;
@@ -166,7 +199,7 @@ function probeTypography() {
     // more lines. An inline box sits in a line box at least as tall as its
     // block's line-height and every enclosing inline box's, so it counts the tallest.
     const size = parseFloat(cs.fontSize);
-    const lhPxOf = (c) => (c.lineHeight === "normal" ? 1.2 * parseFloat(c.fontSize) : parseFloat(c.lineHeight));
+    const lhPxOf = (/** @type {CSSStyleDeclaration} */ c) => (c.lineHeight === "normal" ? 1.2 * parseFloat(c.fontSize) : parseFloat(c.lineHeight));
     let lhPx = lhPxOf(cs);
     if (cs.display === "inline") {
       let up = el.parentElement;
@@ -182,10 +215,11 @@ function probeTypography() {
       // Count text lines from the element's text nodes only (icons and
       // badges inside an inline-flex row are not lines), clustering line
       // boxes whose tops are closer than half a line apart.
+      /** @type {number[]} */
       const tops = [];
       const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-        if (!n.textContent.trim()) continue;
+        if (!n.textContent?.trim()) continue;
         const range = document.createRange();
         range.selectNodeContents(n);
         for (const r of range.getClientRects()) if (r.width > 0) tops.push(r.top);
@@ -206,16 +240,17 @@ function probeTypography() {
 
 function probeTargets() {
   const sel = 'a[href], button, input:not([type=hidden]), select, textarea, summary, [role=button], [role=link], [tabindex]:not([tabindex="-1"])';
+  /** @type {Issue[]} */
   const bad = [];
-  const describe = (el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "");
-  for (const el of document.querySelectorAll(sel)) {
+  const describe = (/** @type {Element} */ el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent?.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "");
+  for (const el of /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll(sel))) {
     const cs = getComputedStyle(el);
     if (cs.display === "none" || cs.visibility === "hidden") continue;
     const r = el.getBoundingClientRect();
     if (r.width <= 1 && r.height <= 1) continue; // not shown (e.g. sr-only skip link before focus)
     if (r.width >= 24 && r.height >= 24) continue;
     // A checkbox or radio is activated through its label too, so a label of 24×24 or more is its target.
-    if (["checkbox", "radio"].includes(el.type) && [...(el.labels ?? [])].some((l) => { const b = l.getBoundingClientRect(); return b.width >= 24 && b.height >= 24; })) continue;
+    if (el instanceof HTMLInputElement && ["checkbox", "radio"].includes(el.type) && [...(el.labels ?? [])].some((l) => { const b = l.getBoundingClientRect(); return b.width >= 24 && b.height >= 24; })) continue;
     // Inline exception (2.5.8): a link inside a sentence. Only the parent's own
     // words count, not the text of sibling links, so a row of links joined by
     // separators is not a sentence however long it is.
@@ -224,7 +259,7 @@ function probeTargets() {
       let words = "";
       const walker = document.createTreeWalker(parent, NodeFilter.SHOW_TEXT);
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-        const owner = n.parentElement.closest(sel);
+        const owner = n.parentElement?.closest(sel);
         if (!owner || !parent.contains(owner)) words += n.textContent;
       }
       if ((words.match(/\p{L}/gu) ?? []).length >= 3) continue;
@@ -237,6 +272,7 @@ function probeTargets() {
 // Records each focusable element's outline (with its offset) and box-shadow before any Tab, so
 // probeFocus can tell a focus indicator from a shadow the element always has.
 function probeRestStyles() {
+  /** @type {WeakMap<Element, { outline: string, shadow: string }>} */
   const rest = new WeakMap();
   for (const el of document.querySelectorAll("*")) {
     const cs = getComputedStyle(el);
@@ -250,7 +286,7 @@ async function probeFocus() {
   if (!el || el === document.body) return null;
   // Read the settled state: a focus ring under `transition-all` starts transparent, and
   // `scroll-behavior: smooth` is still bringing the element into view right after Tab.
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const sleep = (/** @type {number} */ ms) => new Promise((r) => setTimeout(r, ms));
   await Promise.race([
     Promise.all(el.getAnimations().filter((a) => a.effect?.getComputedTiming?.().iterations !== Infinity).map((a) => a.finished.catch(() => {}))),
     sleep(1000),
@@ -264,9 +300,9 @@ async function probeFocus() {
   }
   const cs = getComputedStyle(el);
   // A fully transparent colour paints nothing (Tailwind's outline-hidden, the 0 0 #0000 ring reset).
-  const clear = (c) => c === "transparent" || /^rgba\([^)]*,\s*0(\.0+)?\)$|\/\s*0(\.0+)?\)$/.test(c.trim());
+  const clear = (/** @type {string} */ c) => c === "transparent" || /^rgba\([^)]*,\s*0(\.0+)?\)$|\/\s*0(\.0+)?\)$/.test(c.trim());
   const shadows = cs.boxShadow === "none" ? [] : cs.boxShadow.split(/,(?![^(]*\))/);
-  const paints = (p) => {
+  const paints = (/** @type {string} */ p) => {
     const color = p.match(/(rgba?|hsla?|oklch|oklab|lab|lch|color)\([^)]*\)/)?.[0] ?? "";
     return !(color && clear(color)) && /[1-9]/.test(p.replace(color, ""));
   };
@@ -277,14 +313,15 @@ async function probeFocus() {
   const shadowRing = shadows.some(paints) && cs.boxShadow !== rest.shadow;
   // A control faded out (by itself or an ancestor) hides its indicator with it.
   let opacity = 1;
-  for (let a = el; a; a = a.parentElement) opacity *= parseFloat(getComputedStyle(a).opacity);
+  for (let /** @type {Element | null} */ a = el; a; a = a.parentElement) opacity *= parseFloat(getComputedStyle(a).opacity);
   const transparent = opacity < 0.1;
   const ring = (outlineRing || shadowRing) && !transparent;
   const r = el.getBoundingClientRect();
+  /** @type {Array<[number, number]>} */
   const pts = [[0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]].map(([x, y]) => [r.left + r.width * x, r.top + r.height * y]);
   // The browser scrolls a focused element into view, so a point still outside
   // the viewport is one nobody can see; it counts as hidden like a covered one.
-  const outside = ([x, y]) => x < 0 || y < 0 || x >= innerWidth || y >= innerHeight;
+  const outside = (/** @type {[number, number]} */ [x, y]) => x < 0 || y < 0 || x >= innerWidth || y >= innerHeight;
   const offscreen = pts.every(outside);
   const covered = pts.every((p) => {
     if (outside(p)) return true;
@@ -301,34 +338,39 @@ async function probeFocus() {
     skipTarget = !!(t && main && (t === main || t.contains(main) || t === main.firstElementChild || t === main.querySelector("h1")));
   }
   const key = el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + `@${Math.round(r.left)},${Math.round(r.top + scrollY)}`;
-  return { key, ring, transparent, covered, offscreen, isSkip: el.tagName === "A" && skipTarget, label: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "") };
+  return { key, ring, transparent, covered, offscreen, isSkip: el.tagName === "A" && skipTarget, label: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent?.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "") };
 }
 
 // WCAG 2.3.3 covers motion: movement, scaling, rotation, size. Fades and
 // colour changes are not motion, so animations that only touch those pass.
 // Runs as an init script: CSS animations and transitions are recorded as they
 // start, so one that is over before the probe reads the page still counts.
+/** @param {number} limit */
 function recordMotion(limit) {
   // Any *-color property counts as colour: getKeyframes() expands shorthands into longhands
   // (border-color -> borderTopColor...) and names them in camelCase; transitionProperty is hyphenated.
   const quiet = /^(opacity|fill|stroke|visibility|offset|easing|composite|computed-offset|([a-z]+-)*color)$/i;
-  const hyphenate = (p) => p.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+  const hyphenate = (/** @type {string} */ p) => p.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
   const seen = new WeakSet();
+  /** @type {Array<{ name: string, duration: unknown, iterations: unknown, el: string }>} */
   const found = [];
+  /** @param {Animation & { animationName?: string, transitionProperty?: string }} a CSSAnimation or CSSTransition */
   const take = (a) => {
     if (seen.has(a) || a.playState !== "running") return;
     seen.add(a);
-    const frames = a.effect?.getKeyframes?.() ?? [];
+    const effect = /** @type {KeyframeEffect | null} */ (a.effect);
+    const frames = effect?.getKeyframes?.() ?? [];
     const props = new Set(frames.flatMap((f) => Object.keys(f)));
     if (a.transitionProperty) props.add(a.transitionProperty);
     if (![...props].some((p) => !quiet.test(hyphenate(p)))) return;
-    const t = a.effect?.getComputedTiming?.() ?? {};
+    /** @type {ComputedEffectTiming} */
+    const t = effect?.getComputedTiming?.() ?? {};
     if (!(t.iterations === Infinity || (typeof t.duration === "number" && t.duration > limit))) return;
-    const target = a.effect?.target;
+    const target = effect?.target;
     found.push({ name: a.animationName ?? a.transitionProperty ?? a.constructor.name, duration: t.duration, iterations: t.iterations, el: target ? target.tagName.toLowerCase() + (target.id ? `#${target.id}` : "") : "?" });
   };
   for (const type of ["animationstart", "transitionstart"]) {
-    addEventListener(type, (e) => e.target.getAnimations?.().forEach(take), true);
+    addEventListener(type, (e) => /** @type {Element | null} */ (e.target)?.getAnimations?.().forEach(take), true);
   }
   // Web Animations started from script (element.animate) fire no event: read them at probe time.
   window.__designFloorMotion = () => { document.getAnimations().forEach(take); return found; };
@@ -339,6 +381,7 @@ function recordMotion(limit) {
 // Scroll-triggered entrances (whileInView, IntersectionObserver) keep
 // below-the-fold content transparent, and axe skips transparent text. Scroll
 // the page through once so everything is revealed, then return to the top.
+/** @param {Page} page */
 async function revealAll(page) {
   await page.evaluate(async (maxSteps) => {
     const step = Math.max(200, Math.floor(innerHeight * 0.8));
@@ -352,6 +395,10 @@ async function revealAll(page) {
 
 // JS-driven animation (framer-motion, GSAP) is invisible to getAnimations(),
 // so also wait until opacity and transforms stop changing.
+/**
+ * @param {Page} page
+ * @param {number} [ms]
+ */
 async function settleAnimations(page, ms = 3000) {
   await page.evaluate((limit) => Promise.race([
     Promise.all(document.getAnimations()
@@ -375,6 +422,10 @@ async function settleAnimations(page, ms = 3000) {
 
 // Asks Chromium which fonts actually drew each tagged Thai element. Latin-first
 // stacks ("Inter", "Noto Sans Thai", …) pass because Noto draws the Thai glyphs.
+/**
+ * @param {Page} page
+ * @returns {Promise<Issue[]>}
+ */
 async function renderedThaiFonts(page) {
   const cdp = await page.context().newCDPSession(page);
   try {
@@ -382,6 +433,7 @@ async function renderedThaiFonts(page) {
     await cdp.send("CSS.enable");
     const { root } = await cdp.send("DOM.getDocument", { depth: -1 });
     const { nodeIds } = await cdp.send("DOM.querySelectorAll", { nodeId: root.nodeId, selector: "[data-design-floor-thai]" });
+    /** @type {Issue[]} */
     const bad = [];
     for (const nodeId of nodeIds) {
       const { attributes } = await cdp.send("DOM.getAttributes", { nodeId });
@@ -400,18 +452,34 @@ async function renderedThaiFonts(page) {
 
 // ---------- run ----------
 
+/**
+ * @param {string} rule
+ * @param {string} route
+ * @param {number} width
+ * @param {string} el
+ * @param {string} detail
+ * @returns {Finding}
+ */
 function finding(rule, route, width, el, detail) { return { rule, route, width, el, detail }; }
 
 // axe rules that check a floor row of their own report under that row, so its waiver covers them.
+/** @param {string} id */
 export function axeRule(id) {
   if (id === "color-contrast") return "contrast";
   if (id === "target-size") return "target-size";
   return AXE_LANG_RULES.has(id) ? "lang" : "axe";
 }
 
+/**
+ * @param {Config} cfg
+ * @param {{ shots?: string, launch?: () => Promise<import("playwright").Browser> }} [options]
+ * @returns {Promise<Finding[]>}
+ */
 export async function runChecks(cfg, { shots, launch = () => chromium.launch() } = {}) {
   const target = await startTarget(cfg);
+  /** @type {import("playwright").Browser | undefined} */
   let browser;
+  /** @type {Finding[]} */
   const findings = [];
   try {
     browser = await launch();
@@ -423,7 +491,7 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
         const page = await ctx.newPage();
         const resp = await page.goto(url, { waitUntil: "load" });
         const got = resp?.status();
-        if (!resp || (expected ? got !== expected : got >= 400)) throw new Error(`${url} returned ${got}${expected ? `, expected ${expected}` : ""}`);
+        if (!resp || got === undefined || (expected ? got !== expected : got >= 400)) throw new Error(`${url} returned ${got}${expected ? `, expected ${expected}` : ""}`);
         await page.evaluate(() => document.fonts.ready);
         await revealAll(page);
         await settleAnimations(page);
@@ -432,7 +500,8 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
         if (overflow > 1) findings.push(finding("reflow", route, width, "html", `horizontal scroll of ${overflow} px`));
 
         if (width === 390 || width === 1440) {
-          const axe = await new AxeBuilder({ page }).withTags(AXE_TAGS).analyze();
+          // @axe-core/playwright declares its own copy of playwright's Page type; the object is the same.
+          const axe = await new AxeBuilder({ page: /** @type {any} */ (page) }).withTags(AXE_TAGS).analyze();
           for (const v of axe.violations) {
             const rule = axeRule(v.id);
             for (const n of v.nodes.slice(0, 5)) findings.push(finding(rule, route, width, n.target.join(" "), `${v.id}: ${v.help}`));
@@ -474,7 +543,7 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
             // other stop it already visited, it circles a subset it cannot leave.
             // A modal dialog holds focus on purpose and is left with Escape: only a cycle
             // that Escape does not break is a trap.
-            if (next && seen.has(next.key) && next.key !== first.key) {
+            if (next && seen.has(next.key) && next.key !== first?.key) {
               const cycle = new Set(order.slice(order.indexOf(next.key)));
               await page.keyboard.press("Escape");
               await page.keyboard.press("Tab");
@@ -503,8 +572,8 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
       // Scroll-triggered entrances start only here, so reveal the page under reduced motion too.
       await revealAll(page);
       await page.waitForTimeout(300);
-      for (const a of await page.evaluate(() => window.__designFloorMotion())) {
-        findings.push(finding("reduced-motion", route, 390, a.el, `${a.name} runs ${a.iterations === Infinity ? "infinitely" : `${Math.round(a.duration)} ms`} under reduced motion`));
+      for (const a of await page.evaluate(() => window.__designFloorMotion?.() ?? [])) {
+        findings.push(finding("reduced-motion", route, 390, a.el, `${a.name} runs ${a.iterations === Infinity ? "infinitely" : `${Math.round(Number(a.duration))} ms`} under reduced motion`));
       }
       await ctx.close();
     }
@@ -516,28 +585,43 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
   return findings;
 }
 
+/**
+ * @param {Config} cfg
+ * @param {Finding[]} findings
+ * @param {string} today YYYY-MM-DD
+ * @returns {Result}
+ */
 export function applyWaivers(cfg, findings, today) {
+  /** @type {string[]} */
   const problems = [];
+  /** @type {Waiver[]} */
   const active = [];
   for (const w of cfg.waivers) {
     if (cfg.public && NOT_WAIVABLE_ON_PUBLIC.has(w.rule)) { problems.push(`waiver for ${w.rule} not allowed on a public app`); continue; }
     if (w.expires < today) { problems.push(`waiver for ${w.rule} expired on ${w.expires}`); continue; }
     active.push(w);
   }
-  const covers = (w, f) => w.rule === f.rule && (!w.routes || w.routes.includes(f.route));
+  const covers = (/** @type {Waiver} */ w, /** @type {Finding} */ f) => w.rule === f.rule && (!w.routes || w.routes.includes(f.route));
+  /** @type {Finding[]} */
   const failed = [];
+  /** @type {Finding[]} */
   const waived = [];
   for (const f of findings) (active.some((w) => covers(w, f)) ? waived : failed).push(f);
   return { failed, waived, problems };
 }
 
+/**
+ * @param {Config} cfg
+ * @param {Result} result
+ */
 function summarize(cfg, result) {
   const lines = [];
   lines.push(`design floor ${FLOOR_VERSION} — automated part only; not a WCAG 2.2 AA conformance claim.`);
   lines.push(`manual rows still to sign off in ux-review: ${MANUAL_ROWS.join(", ")}.`);
   const byRule = new Map(RULES.map((r) => [r, { failed: 0, waived: 0 }]));
-  for (const f of result.failed) byRule.get(f.rule).failed++;
-  for (const f of result.waived) byRule.get(f.rule).waived++;
+  // Every finding's rule is one of RULES, so the counter exists.
+  for (const f of result.failed) /** @type {{ failed: number }} */ (byRule.get(f.rule)).failed++;
+  for (const f of result.waived) /** @type {{ waived: number }} */ (byRule.get(f.rule)).waived++;
   for (const [rule, c] of byRule) lines.push(`  ${c.failed ? "FAIL" : c.waived ? "WAIVED" : "PASS"}  ${rule}${c.failed ? ` (${c.failed})` : ""}${c.waived ? ` [${c.waived} waived]` : ""}`);
   for (const p of result.problems) lines.push(`  FAIL  waiver: ${p}`);
   for (const f of result.failed.slice(0, 50)) lines.push(`    - ${f.rule} ${f.route} @${f.width}: ${f.el} — ${f.detail}`);
@@ -545,7 +629,9 @@ function summarize(cfg, result) {
   return lines.join("\n");
 }
 
+/** @param {string[]} argv */
 async function main(argv) {
+  /** @type {{ config: string, json?: string, shots?: string, today?: string }} */
   const args = { config: "design-floor.json" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -556,10 +642,10 @@ async function main(argv) {
     else { console.error(`unknown argument ${a}`); return 2; }
   }
   let cfg;
-  try { cfg = await loadConfig(args.config); } catch (e) { console.error(`config error: ${e.message}`); return 2; }
+  try { cfg = await loadConfig(args.config); } catch (e) { console.error(`config error: ${e instanceof Error ? e.message : e}`); return 2; }
   const today = args.today ?? new Date().toISOString().slice(0, 10);
   let findings;
-  try { findings = await runChecks(cfg, { shots: args.shots }); } catch (e) { console.error(`run error: ${e.message}`); return 2; }
+  try { findings = await runChecks(cfg, { shots: args.shots }); } catch (e) { console.error(`run error: ${e instanceof Error ? e.message : e}`); return 2; }
   const result = applyWaivers(cfg, findings, today);
   console.log(summarize(cfg, result));
   if (args.json) {

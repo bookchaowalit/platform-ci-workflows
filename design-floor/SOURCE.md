@@ -7,9 +7,9 @@ public reusable workflow cannot check out a private repository.
 
 | File | From | SHA-256 |
 |---|---|---|
-| `check.mjs` (1.1.1) | `architecture-docs` @ `76c4750` | `a87e09293124dc71b393d082ca1f5a63c78b6f11d6ef2d3764b40060cb480137` |
-| `package.json` | `architecture-docs` @ `1cffc68`, unchanged since | `7cafdae8d59300cf81a50a25a7a4aa01433cdea5763277f8d7d9cc3152c8d90d` |
-| `package-lock.json` | `architecture-docs` @ `1cffc68`, unchanged since | `e63344ded30de8310f49f65e370b93f1e425f02048ce24d01193425d9cf7da25` |
+| `check.mjs` (1.1.2) | `architecture-docs` @ `439db24` | `f4fbc66911c9a62f726724dd98508130a47e192089389084ed202e68104d7e3e` |
+| `package.json` | `architecture-docs` @ `439db24` (dev dependencies only: typescript, @types/node) | `87c6454671c60c2e4b33acbcaf3906c23256d4431566492c00bf235791d3628b` |
+| `package-lock.json` | `architecture-docs` @ `439db24` | `abf854f0d567bec018deb66da55c7760e17df7acfe4df6af2de5c7f24bfaf8d2` |
 
 Do not edit these files here. To update:
 
