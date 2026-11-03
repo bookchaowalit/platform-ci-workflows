@@ -178,11 +178,10 @@ export async function startTarget(cfg) {
 // Probes are serialised into the page, so their patterns are literals inside them.
 function probeTypography() {
   const thai = /[\u0E00-\u0E7F]/;
-  /** @type {{ thaiElements: number, langMissing: boolean, loadedThaiFace: boolean, typo: Issue[], lang: Issue[] }} */
-  const out = { thaiElements: 0, langMissing: !document.documentElement.getAttribute("lang"), loadedThaiFace: false, typo: [], lang: [] };
-  const faces = [...document.fonts].filter((f) => f.status === "loaded").map((f) => f.family.replace(/["']/g, ""));
-  const isNotoThai = (/** @type {string} */ s) => /noto[\s_-]*(sans|serif)[\s_-]*thai/i.test(s);
-  out.loadedThaiFace = faces.some(isNotoThai);
+  // Which font draws the Thai is decided from what Chromium rendered (renderedThaiFonts), not
+  // from CSS family names: next/font/local and similar tools load Noto under an alias.
+  /** @type {{ thaiElements: number, langMissing: boolean, typo: Issue[], lang: Issue[] }} */
+  const out = { thaiElements: 0, langMissing: !document.documentElement.getAttribute("lang"), typo: [], lang: [] };
   const describe = (/** @type {Element} */ el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.className && typeof el.className === "string" ? "." + el.className.trim().split(/\s+/).join(".") : "");
   // <body> itself can hold Thai text directly, so it is checked with its descendants.
   for (const el of [document.body, ...document.body.querySelectorAll("*")]) {
@@ -398,11 +397,13 @@ function recordMotion(limit) {
 async function revealAll(page) {
   await page.evaluate(async (maxSteps) => {
     const step = Math.max(200, Math.floor(innerHeight * 0.8));
+    // "instant" overrides the page's scroll-behavior: smooth, which would otherwise still be
+    // animating (and interrupted by the next step) when lower content should come into view.
     for (let y = 0, i = 0; y < document.documentElement.scrollHeight && i < maxSteps; y += step, i++) {
-      scrollTo(0, y);
+      scrollTo({ top: y, behavior: "instant" });
       await new Promise((r) => setTimeout(r, 60));
     }
-    scrollTo(0, 0);
+    scrollTo({ top: 0, behavior: "instant" });
   }, MAX_SCROLL_STEPS);
 }
 
@@ -440,26 +441,45 @@ async function settleAnimations(page, ms = 3000) {
  * @returns {Promise<Issue[]>}
  */
 async function renderedThaiFonts(page) {
+  // CDP reports the fonts of a whole element, so in mixed text a Noto Latin subset could hide a
+  // system fallback that drew every Thai character. Each tagged element gets a child run holding
+  // only its Thai characters, laid out off screen in the same font, and that run is what is asked.
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll("[data-design-floor-thai]")) {
+      const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
+      const run = document.createElement("span");
+      run.setAttribute("data-design-floor-thai-run", el.getAttribute("data-design-floor-thai") ?? "");
+      run.setAttribute("aria-hidden", "true");
+      run.style.cssText = "position:absolute;left:-100000px;top:0;white-space:nowrap;visibility:visible";
+      // Joined with nothing: a space between the pieces is drawn by the first font in the stack
+      // (Geist, Inter...), which would read as a fallback although it draws no Thai.
+      run.textContent = (own.match(/[\u0E00-\u0E7F]+/g) ?? []).join("");
+      el.append(run);
+    }
+  });
   const cdp = await page.context().newCDPSession(page);
   try {
     await cdp.send("DOM.enable");
     await cdp.send("CSS.enable");
     const { root } = await cdp.send("DOM.getDocument", { depth: -1 });
-    const { nodeIds } = await cdp.send("DOM.querySelectorAll", { nodeId: root.nodeId, selector: "[data-design-floor-thai]" });
+    const { nodeIds } = await cdp.send("DOM.querySelectorAll", { nodeId: root.nodeId, selector: "[data-design-floor-thai-run]" });
     /** @type {Issue[]} */
     const bad = [];
     for (const nodeId of nodeIds) {
       const { attributes } = await cdp.send("DOM.getAttributes", { nodeId });
-      const label = attributes[attributes.indexOf("data-design-floor-thai") + 1];
+      const label = attributes[attributes.indexOf("data-design-floor-thai-run") + 1];
       const { fonts } = await cdp.send("CSS.getPlatformFontsForNode", { nodeId });
-      if (!fonts.some((f) => f.glyphCount > 0)) continue; // nothing painted (hidden or clipped)
-      if (!fonts.some((f) => /noto\s*(sans|serif)\s*thai/i.test(f.familyName) && f.glyphCount > 0)) {
+      const drew = fonts.filter((f) => f.glyphCount > 0);
+      if (!drew.length) continue; // nothing laid out
+      // Every Thai glyph must come from Noto Sans/Serif Thai: any other font with glyphs here is a fallback.
+      if (drew.some((f) => !/noto\s*(sans|serif)\s*thai/i.test(f.familyName))) {
         bad.push({ el: label, detail: `rendered with ${fonts.map((f) => f.familyName).join(", ") || "no font"}` });
       }
     }
     return bad;
   } finally {
     await cdp.detach();
+    await page.evaluate(() => document.querySelectorAll("[data-design-floor-thai-run]").forEach((n) => n.remove()));
   }
 }
 
@@ -524,7 +544,6 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
         if (width === 390) {
           const t = await page.evaluate(probeTypography);
           if (t.langMissing) findings.push(finding("lang", route, width, "html", "<html> has no lang attribute"));
-          if (t.thaiElements > 0 && !t.loadedThaiFace) findings.push(finding("thai-font", route, width, "document", "no Noto Sans/Serif Thai font face loaded"));
           for (const f of await renderedThaiFonts(page)) findings.push(finding("thai-font", route, width, f.el, f.detail));
           for (const f of t.typo) findings.push(finding("thai-typography", route, width, f.el, f.detail));
           for (const f of t.lang) findings.push(finding("lang", route, width, f.el, f.detail));
