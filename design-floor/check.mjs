@@ -111,7 +111,16 @@ function staticServer(root) {
       const inside = path.relative(root, file);
       if (inside.startsWith("..") || path.isAbsolute(inside)) throw new Error("outside root");
       let s = await stat(file).catch(() => null);
-      if (s?.isDirectory()) { file = path.join(file, "index.html"); s = await stat(file).catch(() => null); }
+      if (s?.isDirectory()) {
+        // Like static hosts: /dir answers 301 to /dir/, so relative URLs in its index resolve there.
+        if (!p.endsWith("/")) {
+          const { search } = new URL(req.url ?? "/", "http://x");
+          res.writeHead(301, { location: encodeURI(p) + "/" + search }).end();
+          return;
+        }
+        file = path.join(file, "index.html");
+        s = await stat(file).catch(() => null);
+      }
       if (!s && !path.extname(file)) { file += ".html"; s = await stat(file).catch(() => null); }
       if (!s) {
         // Like static hosts (Vercel, Netlify, Pages): a miss gets 404.html with status 404.
@@ -220,8 +229,16 @@ function probeTypography() {
       /** @type {number[]} */
       const tops = [];
       const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      // A descendant block lays out its own lines with its own leading; only text in this
+      // element's line boxes (directly or through inline boxes) counts.
+      const inOwnLines = (/** @type {Node} */ n) => {
+        for (let a = n.parentElement; a && a !== el; a = a.parentElement) {
+          if (!["inline", "contents"].includes(getComputedStyle(a).display)) return false;
+        }
+        return true;
+      };
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-        if (!n.textContent?.trim()) continue;
+        if (!n.textContent?.trim() || !inOwnLines(n)) continue;
         const range = document.createRange();
         range.selectNodeContents(n);
         for (const r of range.getClientRects()) if (r.width > 0) tops.push(r.top);
@@ -363,10 +380,16 @@ function recordMotion(limit) {
     const effect = /** @type {KeyframeEffect | null} */ (a.effect);
     const frames = effect?.getKeyframes?.() ?? [];
     // Only properties whose value changes count: a fade that also repeats one `transform` at
-    // every keyframe moves nothing. A property missing from some keyframes changes implicitly.
+    // every keyframe moves nothing. A property is constant only when it is set at both ends
+    // (offsets 0 and 1) and every keyframe that sets it agrees; an end it is missing from
+    // takes the element's own value, so `to { transform: … }` alone does move.
+    const at = (/** @type {number} */ offset) => frames.find((f) => f.computedOffset === offset);
+    const start = at(0);
+    const end = at(1);
     const props = new Set(frames.flatMap((f) => Object.keys(f)).filter((p) => {
-      const values = frames.map((f) => (p in f ? String(/** @type {Record<string, unknown>} */ (f)[p]) : undefined));
-      return values.includes(undefined) || new Set(values).size > 1;
+      if (!start || !end || !(p in start) || !(p in end)) return true;
+      const values = frames.filter((f) => p in f).map((f) => String(/** @type {Record<string, unknown>} */ (f)[p]));
+      return new Set(values).size > 1;
     }));
     if (a.transitionProperty) props.add(a.transitionProperty);
     if (![...props].some((p) => !quiet.test(hyphenate(p)))) return;
