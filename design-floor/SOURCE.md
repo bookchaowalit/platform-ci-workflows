@@ -2,12 +2,12 @@
 
 Copy of the ADR-0007 design floor checker, run by
 [`design-floor.yml`](../.github/workflows/design-floor.yml). The source of truth, its tests and
-its 37 fixtures live in `architecture-docs/design-floor/` (private); this copy exists because a
+its 44 fixtures live in `architecture-docs/design-floor/` (private); this copy exists because a
 public reusable workflow cannot check out a private repository.
 
 | File | From | SHA-256 |
 |---|---|---|
-| `check.mjs` (1.1.0) | `architecture-docs` @ `370bc88` | `2e85f5c15633d984ddaba411efd63361fa7f09e7a6aa1f06dcb5f19ecd153bce` |
+| `check.mjs` (1.1.1) | `architecture-docs` @ `76c4750` | `a87e09293124dc71b393d082ca1f5a63c78b6f11d6ef2d3764b40060cb480137` |
 | `package.json` | `architecture-docs` @ `1cffc68`, unchanged since | `7cafdae8d59300cf81a50a25a7a4aa01433cdea5763277f8d7d9cc3152c8d90d` |
 | `package-lock.json` | `architecture-docs` @ `1cffc68`, unchanged since | `e63344ded30de8310f49f65e370b93f1e425f02048ce24d01193425d9cf7da25` |
 

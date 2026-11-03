@@ -116,7 +116,8 @@ function staticServer(root) {
 async function waitFor(url, ms) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
-    try { const r = await fetch(url); if (r.status < 500) return; } catch { /* not up yet */ }
+    // Each request gets only the time left, so an app that accepts but never answers cannot outlast the deadline.
+    try { const r = await fetch(url, { signal: AbortSignal.timeout(Math.max(1, end - Date.now())) }); if (r.status < 500) return; } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 500));
   }
   throw new Error(`target did not answer at ${url} within ${ms / 1000}s`);
@@ -131,7 +132,7 @@ export async function startTarget(cfg) {
     try {
       await waitFor(t.url, (t.timeoutSeconds ?? 120) * 1000);
     } catch (e) {
-      process.kill(-child.pid, "SIGTERM");
+      try { process.kill(-child.pid, "SIGTERM"); } catch { /* already exited */ }
       throw e;
     }
     return { url: t.url, stop: async () => { try { process.kill(-child.pid, "SIGTERM"); } catch { /* gone */ } } };
@@ -162,15 +163,17 @@ function probeTypography() {
     if (out.thaiElements < 30) el.setAttribute("data-design-floor-thai", describe(el));
     out.thaiElements++;
     // Leading matters where Thai lines stack: boxes whose text wraps to two or
-    // more lines. An inline box sits in the line box of its block, which is at
-    // least as tall as the block's own line-height, so it counts the taller one.
+    // more lines. An inline box sits in a line box at least as tall as its
+    // block's line-height and every enclosing inline box's, so it counts the tallest.
     const size = parseFloat(cs.fontSize);
     const lhPxOf = (c) => (c.lineHeight === "normal" ? 1.2 * parseFloat(c.fontSize) : parseFloat(c.lineHeight));
     let lhPx = lhPxOf(cs);
     if (cs.display === "inline") {
-      let block = el.parentElement;
-      while (block && ["inline", "contents"].includes(getComputedStyle(block).display)) block = block.parentElement;
-      if (block) lhPx = Math.max(lhPx, lhPxOf(getComputedStyle(block)));
+      let up = el.parentElement;
+      for (let d; up && ["inline", "contents"].includes((d = getComputedStyle(up)).display); up = up.parentElement) {
+        if (d.display === "inline") lhPx = Math.max(lhPx, lhPxOf(d));
+      }
+      if (up) lhPx = Math.max(lhPx, lhPxOf(getComputedStyle(up)));
     }
     const lh = lhPx / size;
     const heading = !!el.closest("h1, h2, h3, h4, h5, h6") || size >= 24;
@@ -211,13 +214,19 @@ function probeTargets() {
     const r = el.getBoundingClientRect();
     if (r.width <= 1 && r.height <= 1) continue; // not shown (e.g. sr-only skip link before focus)
     if (r.width >= 24 && r.height >= 24) continue;
+    // A checkbox or radio is activated through its label too, so a label of 24×24 or more is its target.
+    if (["checkbox", "radio"].includes(el.type) && [...(el.labels ?? [])].some((l) => { const b = l.getBoundingClientRect(); return b.width >= 24 && b.height >= 24; })) continue;
     // Inline exception (2.5.8): a link inside a sentence. Only the parent's own
     // words count, not the text of sibling links, so a row of links joined by
     // separators is not a sentence however long it is.
     if (el.tagName === "A" && cs.display === "inline" && el.parentElement) {
-      const words = [...el.parentElement.childNodes]
-        .filter((n) => n.nodeType === 3 || (n.nodeType === 1 && !n.matches(sel) && !n.querySelector(sel)))
-        .map((n) => n.textContent).join("");
+      const parent = el.parentElement;
+      let words = "";
+      const walker = document.createTreeWalker(parent, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        const owner = n.parentElement.closest(sel);
+        if (!owner || !parent.contains(owner)) words += n.textContent;
+      }
       if ((words.match(/\p{L}/gu) ?? []).length >= 3) continue;
     }
     bad.push({ el: describe(el), detail: `${Math.round(r.width)}×${Math.round(r.height)} px` });
@@ -225,13 +234,13 @@ function probeTargets() {
   return bad;
 }
 
-// Records each focusable element's outline and box-shadow before any Tab, so
+// Records each focusable element's outline (with its offset) and box-shadow before any Tab, so
 // probeFocus can tell a focus indicator from a shadow the element always has.
 function probeRestStyles() {
   const rest = new WeakMap();
   for (const el of document.querySelectorAll("*")) {
     const cs = getComputedStyle(el);
-    rest.set(el, { outline: `${cs.outlineStyle} ${cs.outlineWidth} ${cs.outlineColor}`, shadow: cs.boxShadow });
+    rest.set(el, { outline: `${cs.outlineStyle} ${cs.outlineWidth} ${cs.outlineColor} ${cs.outlineOffset}`, shadow: cs.boxShadow });
   }
   window.__designFloorRest = rest;
 }
@@ -261,11 +270,16 @@ async function probeFocus() {
     const color = p.match(/(rgba?|hsla?|oklch|oklab|lab|lch|color)\([^)]*\)/)?.[0] ?? "";
     return !(color && clear(color)) && /[1-9]/.test(p.replace(color, ""));
   };
-  const outline = `${cs.outlineStyle} ${cs.outlineWidth} ${cs.outlineColor}`;
+  // The offset counts too: a ring that only moves out from the edge on focus is a visible change.
+  const outline = `${cs.outlineStyle} ${cs.outlineWidth} ${cs.outlineColor} ${cs.outlineOffset}`;
   const rest = window.__designFloorRest?.get(el) ?? { outline: "", shadow: "" };
   const outlineRing = cs.outlineStyle !== "none" && parseFloat(cs.outlineWidth) > 0 && !clear(cs.outlineColor) && outline !== rest.outline;
   const shadowRing = shadows.some(paints) && cs.boxShadow !== rest.shadow;
-  const ring = outlineRing || shadowRing;
+  // A control faded out (by itself or an ancestor) hides its indicator with it.
+  let opacity = 1;
+  for (let a = el; a; a = a.parentElement) opacity *= parseFloat(getComputedStyle(a).opacity);
+  const transparent = opacity < 0.1;
+  const ring = (outlineRing || shadowRing) && !transparent;
   const r = el.getBoundingClientRect();
   const pts = [[0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]].map(([x, y]) => [r.left + r.width * x, r.top + r.height * y]);
   // The browser scrolls a focused element into view, so a point still outside
@@ -287,7 +301,7 @@ async function probeFocus() {
     skipTarget = !!(t && main && (t === main || t.contains(main) || t === main.firstElementChild || t === main.querySelector("h1")));
   }
   const key = el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + `@${Math.round(r.left)},${Math.round(r.top + scrollY)}`;
-  return { key, ring, covered, offscreen, isSkip: el.tagName === "A" && skipTarget, label: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "") };
+  return { key, ring, transparent, covered, offscreen, isSkip: el.tagName === "A" && skipTarget, label: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "") };
 }
 
 // WCAG 2.3.3 covers motion: movement, scaling, rotation, size. Fades and
@@ -442,9 +456,11 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
           if (!first?.isSkip) findings.push(finding("skip-link", route, width, first?.label ?? "(nothing focused)", "first Tab stop is not a skip link to an existing target"));
           let state = first;
           const seen = new Set();
+          const order = [];
           for (let i = 0; i < MAX_TAB_STOPS && state && !seen.has(state.key); i++) {
             seen.add(state.key);
-            if (!state.ring) findings.push(finding("focus-visible", route, width, state.label, "no outline or box-shadow while focused"));
+            order.push(state.key);
+            if (!state.ring) findings.push(finding("focus-visible", route, width, state.label, state.transparent ? "focused element is transparent (opacity)" : "no outline or box-shadow while focused"));
             if (state.covered) findings.push(finding("focus-not-obscured", route, width, state.label, state.offscreen ? "focused element is outside the viewport" : "focused element is fully covered"));
             let next = null;
             let stuck = 0;
@@ -456,7 +472,16 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
             if (stuck === 3) { findings.push(finding("keyboard-trap", route, width, state.label, "focus did not move after 3 Tabs")); break; }
             // Focus that returns to the first stop wrapped around the page; back to any
             // other stop it already visited, it circles a subset it cannot leave.
-            if (next && seen.has(next.key) && next.key !== first.key) { findings.push(finding("keyboard-trap", route, width, next.label, "focus cycles through a group of elements it cannot leave")); break; }
+            // A modal dialog holds focus on purpose and is left with Escape: only a cycle
+            // that Escape does not break is a trap.
+            if (next && seen.has(next.key) && next.key !== first.key) {
+              const cycle = new Set(order.slice(order.indexOf(next.key)));
+              await page.keyboard.press("Escape");
+              await page.keyboard.press("Tab");
+              const after = await page.evaluate(probeFocus);
+              if (after && cycle.has(after.key)) findings.push(finding("keyboard-trap", route, width, next.label, "focus cycles through a group of elements that Escape does not leave"));
+              break;
+            }
             state = next;
           }
         }
@@ -475,6 +500,8 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
       await ctx.addInitScript(recordMotion, MOTION_LIMIT_MS);
       const page = await ctx.newPage();
       await page.goto(url, { waitUntil: "load" });
+      // Scroll-triggered entrances start only here, so reveal the page under reduced motion too.
+      await revealAll(page);
       await page.waitForTimeout(300);
       for (const a of await page.evaluate(() => window.__designFloorMotion())) {
         findings.push(finding("reduced-motion", route, 390, a.el, `${a.name} runs ${a.iterations === Infinity ? "infinitely" : `${Math.round(a.duration)} ms`} under reduced motion`));
