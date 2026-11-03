@@ -107,7 +107,9 @@ function staticServer(root) {
     try {
       let p = decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname);
       let file = path.join(root, p);
-      if (!file.startsWith(root)) throw new Error("outside root");
+      // A path-segment boundary: "/site-secret" must not pass as inside "/site".
+      const inside = path.relative(root, file);
+      if (inside.startsWith("..") || path.isAbsolute(inside)) throw new Error("outside root");
       let s = await stat(file).catch(() => null);
       if (s?.isDirectory()) { file = path.join(file, "index.html"); s = await stat(file).catch(() => null); }
       if (!s && !path.extname(file)) { file += ".html"; s = await stat(file).catch(() => null); }
@@ -182,7 +184,8 @@ function probeTypography() {
   const isNotoThai = (/** @type {string} */ s) => /noto[\s_-]*(sans|serif)[\s_-]*thai/i.test(s);
   out.loadedThaiFace = faces.some(isNotoThai);
   const describe = (/** @type {Element} */ el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.className && typeof el.className === "string" ? "." + el.className.trim().split(/\s+/).join(".") : "");
-  for (const el of document.body.querySelectorAll("*")) {
+  // <body> itself can hold Thai text directly, so it is checked with its descendants.
+  for (const el of [document.body, ...document.body.querySelectorAll("*")]) {
     const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
     if (!thai.test(own)) continue;
     const cs = getComputedStyle(el);
@@ -365,14 +368,24 @@ function recordMotion(limit) {
     if (![...props].some((p) => !quiet.test(hyphenate(p)))) return;
     /** @type {ComputedEffectTiming} */
     const t = effect?.getComputedTiming?.() ?? {};
-    if (!(t.iterations === Infinity || (typeof t.duration === "number" && t.duration > limit))) return;
+    // activeDuration covers every iteration: ten 150 ms slides are 1.5 s of motion.
+    const total = typeof t.activeDuration === "number" ? t.activeDuration : t.duration;
+    if (!(t.iterations === Infinity || (typeof total === "number" && total > limit))) return;
     const target = effect?.target;
-    found.push({ name: a.animationName ?? a.transitionProperty ?? a.constructor.name, duration: t.duration, iterations: t.iterations, el: target ? target.tagName.toLowerCase() + (target.id ? `#${target.id}` : "") : "?" });
+    found.push({ name: a.animationName ?? a.transitionProperty ?? a.constructor.name, duration: total, iterations: t.iterations, el: target ? target.tagName.toLowerCase() + (target.id ? `#${target.id}` : "") : "?" });
   };
   for (const type of ["animationstart", "transitionstart"]) {
     addEventListener(type, (e) => /** @type {Element | null} */ (e.target)?.getAnimations?.().forEach(take), true);
   }
-  // Web Animations started from script (element.animate) fire no event: read them at probe time.
+  // Web Animations started from script (element.animate) fire no event: record each as it is
+  // created, so a short one is counted after it has finished; the rest are read at probe time.
+  const animate = Element.prototype.animate;
+  /** @type {Element["animate"]} */
+  Element.prototype.animate = function (keyframes, options) {
+    const animation = animate.call(this, keyframes, options);
+    queueMicrotask(() => take(animation));
+    return animation;
+  };
   window.__designFloorMotion = () => { document.getAnimations().forEach(take); return found; };
 }
 
@@ -538,7 +551,14 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
               next = await page.evaluate(probeFocus);
               if (!next || next.key !== state.key) break;
             }
-            if (stuck === 3) { findings.push(finding("keyboard-trap", route, width, state.label, "focus did not move after 3 Tabs")); break; }
+            if (stuck === 3) {
+              // As with a cycle below: a control that holds Tab on purpose may let Escape out.
+              await page.keyboard.press("Escape");
+              await page.keyboard.press("Tab");
+              const after = await page.evaluate(probeFocus);
+              if (after && after.key === state.key) findings.push(finding("keyboard-trap", route, width, state.label, "focus did not move after 3 Tabs or Escape"));
+              break;
+            }
             // Focus that returns to the first stop wrapped around the page; back to any
             // other stop it already visited, it circles a subset it cannot leave.
             // A modal dialog holds focus on purpose and is left with Escape: only a cycle
