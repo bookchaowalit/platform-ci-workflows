@@ -2,12 +2,12 @@
 
 Copy of the ADR-0007 design floor checker, run by
 [`design-floor.yml`](../.github/workflows/design-floor.yml). The source of truth, its tests and
-its 53 fixtures live in `architecture-docs/design-floor/` (private); this copy exists because a
+its 55 fixtures live in `architecture-docs/design-floor/` (private); this copy exists because a
 public reusable workflow cannot check out a private repository.
 
 | File | From | SHA-256 |
 |---|---|---|
-| `check.mjs` (1.1.5) | `architecture-docs` @ `9f0bd1d` | `482deb00e7c371901d0a87043e85f9b17d399ecbb64fd39d3df907414ace96e8` |
+| `check.mjs` (1.1.6) | `architecture-docs` @ `ba8ff2c` | `a3e376c86f9b6dd405e82d841a86f33af9d054686f9bf5803295ddb9c39a919c` |
 | `package.json` | `architecture-docs` @ `439db24` (dev dependencies only: typescript, @types/node) | `87c6454671c60c2e4b33acbcaf3906c23256d4431566492c00bf235791d3628b` |
 | `package-lock.json` | `architecture-docs` @ `439db24` | `abf854f0d567bec018deb66da55c7760e17df7acfe4df6af2de5c7f24bfaf8d2` |
 | `tsconfig.json` | `architecture-docs` @ `eb9dbca` (type check only: self-test `checker-typecheck` runs `tsc`) | `9003e3c75014f7a193fee2de10b706520a516d57c00d6d5bfdf98f19ed521b03` |

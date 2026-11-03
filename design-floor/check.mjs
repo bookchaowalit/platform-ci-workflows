@@ -362,7 +362,12 @@ function recordMotion(limit) {
     seen.add(a);
     const effect = /** @type {KeyframeEffect | null} */ (a.effect);
     const frames = effect?.getKeyframes?.() ?? [];
-    const props = new Set(frames.flatMap((f) => Object.keys(f)));
+    // Only properties whose value changes count: a fade that also repeats one `transform` at
+    // every keyframe moves nothing. A property missing from some keyframes changes implicitly.
+    const props = new Set(frames.flatMap((f) => Object.keys(f)).filter((p) => {
+      const values = frames.map((f) => (p in f ? String(/** @type {Record<string, unknown>} */ (f)[p]) : undefined));
+      return values.includes(undefined) || new Set(values).size > 1;
+    }));
     if (a.transitionProperty) props.add(a.transitionProperty);
     if (![...props].some((p) => !quiet.test(hyphenate(p)))) return;
     /** @type {ComputedEffectTiming} */
@@ -587,12 +592,18 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
               if (after && after.key === state.key) findings.push(finding("keyboard-trap", route, width, state.label, "focus did not move after 3 Tabs or Escape"));
               break;
             }
-            // Focus that returns to the first stop wrapped around the page; back to any
-            // other stop it already visited, it circles a subset it cannot leave.
-            // A modal dialog holds focus on purpose and is left with Escape: only a cycle
-            // that Escape does not break is a trap.
-            if (next && seen.has(next.key) && next.key !== first?.key) {
+            // Focus back on a stop it already visited, without passing through the page
+            // (a real wrap goes via the browser UI, where nothing is focused), circles a group.
+            // It is a trap only when the page has tabbable controls the group never reached
+            // (a small page may wrap straight back), and only if Escape does not break it
+            // (a modal dialog holds focus on purpose and is left with Escape).
+            if (next && seen.has(next.key)) {
               const cycle = new Set(order.slice(order.indexOf(next.key)));
+              const tabbable = await page.evaluate(() => [...document.querySelectorAll(
+                'a[href], button, input:not([type=hidden]), select, textarea, summary, [tabindex]:not([tabindex="-1"])',
+              )].filter((el) => !(/** @type {HTMLElement} */ (el)).matches(":disabled, [inert] *") && (/** @type {HTMLElement} */ (el)).tabIndex >= 0
+                && el.getClientRects().length > 0 && getComputedStyle(el).visibility === "visible").length);
+              if (cycle.size >= tabbable) break; // every control was reached: a wrap, not a trap
               await page.keyboard.press("Escape");
               await page.keyboard.press("Tab");
               const after = await page.evaluate(probeFocus);
