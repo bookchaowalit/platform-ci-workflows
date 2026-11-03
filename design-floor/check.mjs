@@ -114,8 +114,10 @@ function staticServer(root) {
       if (s?.isDirectory()) {
         // Like static hosts: /dir answers 301 to /dir/, so relative URLs in its index resolve there.
         if (!p.endsWith("/")) {
-          const { search } = new URL(req.url ?? "/", "http://x");
-          res.writeHead(301, { location: encodeURI(p) + "/" + search }).end();
+          // The request's own (still escaped) path: re-encoding the decoded one would turn a "%23"
+          // in a folder name into a literal "#".
+          const { pathname, search } = new URL(req.url ?? "/", "http://x");
+          res.writeHead(301, { location: pathname + "/" + search }).end();
           return;
         }
         file = path.join(file, "index.html");
@@ -146,10 +148,14 @@ function staticServer(root) {
 /**
  * @param {string} url
  * @param {number} ms
+ * @param {() => number | null} [exitCode] the served app's exit code once it has exited
  */
-async function waitFor(url, ms) {
+async function waitFor(url, ms, exitCode) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
+    // An app that exited is not up, even if something else answers on its port.
+    const code = exitCode?.();
+    if (code !== undefined && code !== null) throw new Error(`target exited with code ${code} before answering at ${url}`);
     // Each request gets only the time left, so an app that accepts but never answers cannot outlast the deadline.
     try { const r = await fetch(url, { signal: AbortSignal.timeout(Math.max(1, end - Date.now())) }); if (r.status < 500) return; } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 500));
@@ -167,12 +173,18 @@ export async function startTarget(cfg) {
   // loadConfig guarantees a url with serve, and url when neither static nor serve is set.
   const url = /** @type {string} */ (t.url);
   if (t.serve) {
+    // Something already answering here would be checked instead of the app (which then fails to bind).
+    const taken = await fetch(url, { signal: AbortSignal.timeout(1000) }).then(() => true, () => false);
+    if (taken) throw new Error(`${url} already answers before the app starts: stop whatever holds the port`);
     const [cmd, ...cmdArgs] = t.serve;
     const child = spawn(cmd, cmdArgs, { cwd: cfg.baseDir, shell: false, stdio: "ignore", detached: true });
     // The process group to signal; spawn leaves pid unset only when the command failed to start.
     const group = -(child.pid ?? 0);
+    /** @type {number | null} */
+    let exited = null;
+    child.on("exit", (code, signal) => { exited = code ?? (signal ? 128 : 1); });
     try {
-      await waitFor(url, (t.timeoutSeconds ?? 120) * 1000);
+      await waitFor(url, (t.timeoutSeconds ?? 120) * 1000, () => exited);
     } catch (e) {
       try { if (group) process.kill(group, "SIGTERM"); } catch { /* already exited */ }
       throw e;
@@ -194,9 +206,13 @@ function probeTypography() {
   const describe = (/** @type {Element} */ el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.className && typeof el.className === "string" ? "." + el.className.trim().split(/\s+/).join(".") : "");
   // <body> itself can hold Thai text directly, so it is checked with its descendants.
   for (const el of [document.body, ...document.body.querySelectorAll("*")]) {
-    const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
+    // An input's text is what it shows: a button's label, or a text field's value, or its placeholder while empty.
+    const own = el instanceof HTMLInputElement ? (/^(submit|reset|button)$/.test(el.type) ? el.value
+        : /^(text|search|url|tel|email|number)$/.test(el.type) ? el.value || el.placeholder : "")
+      : [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
     if (!thai.test(own)) continue;
-    const cs = getComputedStyle(el);
+    // A shown placeholder has its own ::placeholder styles (letter-spacing included).
+    const cs = getComputedStyle(el, el instanceof HTMLInputElement && !el.value ? "::placeholder" : null);
     // The element's own visibility is authoritative (it inherits, and a child may set it back to
     // visible). checkVisibility() covers a display:none ancestor; display:contents elements have no
     // box of their own, so ask the nearest ancestor that has one.
@@ -269,7 +285,7 @@ function probeTargets() {
     if (r.width <= 1 && r.height <= 1) continue; // not shown (e.g. sr-only skip link before focus)
     if (r.width >= 24 && r.height >= 24) continue;
     // A checkbox or radio is activated through its label too, so a label of 24×24 or more is its target.
-    if (el instanceof HTMLInputElement && ["checkbox", "radio"].includes(el.type) && [...(el.labels ?? [])].some((l) => { const b = l.getBoundingClientRect(); return b.width >= 24 && b.height >= 24; })) continue;
+    if (el instanceof HTMLInputElement && ["checkbox", "radio"].includes(el.type) && [...(el.labels ?? [])].some((l) => { const b = l.getBoundingClientRect(); return l.checkVisibility({ visibilityProperty: true }) && b.width >= 24 && b.height >= 24; })) continue;
     // Inline exception (2.5.8): a link inside a sentence. Only the parent's own
     // words count, not the text of sibling links, so a row of links joined by
     // separators is not a sentence however long it is.
@@ -422,37 +438,61 @@ function recordMotion(limit) {
 
 // Motion driven from script (requestAnimationFrame loops, libraries that write inline styles)
 // is invisible to getAnimations(). Sample every element's transform and position for a second;
-// one that keeps changing for longer than the limit moves under reduced motion. Elements with a
-// CSS or Web Animation are left to recordMotion.
+// one that changes in more samples than the limit covers moves under reduced motion (idle gaps
+// between two short moves do not add up). Elements that are not rendered are not sampled.
 /** @param {number} limit */
 async function probeScriptedMotion(limit) {
-  const els = [...document.body.querySelectorAll("*")].slice(0, 3000)
-    .filter((el) => el.getAnimations().length === 0);
+  const els = [...document.body.querySelectorAll("*")].slice(0, 3000);
+  // Same reading as recordMotion: a property moves when its value changes or an end leaves it
+  // implicit; opacity, colour and visibility are not motion.
+  const quiet = /^(opacity|offset|easing|composite|computedOffset|visibility|fill|stroke|.*[cC]olor)$/;
+  const moves = (/** @type {ComputedKeyframe[]} */ frames) => {
+    const start = frames.find((f) => f.computedOffset === 0);
+    const end = frames.find((f) => f.computedOffset === 1);
+    return [...new Set(frames.flatMap((f) => Object.keys(f)))].some((p) => !quiet.test(p)
+      && (!start || !end || !(p in start) || !(p in end)
+        || new Set(frames.filter((f) => p in f).map((f) => String(/** @type {Record<string, unknown>} */ (f)[p]))).size > 1));
+  };
+  // Boxes are compared to 0.01 px: a slow drift moves less than a pixel between samples.
   const sample = () => els.map((el) => {
+    if (!el.checkVisibility()) return "hidden";
+    // A finite CSS or Web Animation is timed exactly by recordMotion (200 ms is allowed): while one
+    // runs, the element's movement is not counted here. Infinite ones (a colour pulse) are sampled.
+    // Only an animation that moves something counts: a finite fade or colour change does not hide script motion.
+    if (el.getAnimations().some((a) => a.playState === "running" && a.effect?.getComputedTiming().iterations !== Infinity
+      && moves(/** @type {KeyframeEffect} */ (a.effect).getKeyframes()))) return "animated";
     const c = getComputedStyle(el);
     const r = el.getBoundingClientRect();
-    return `${c.transform}|${c.translate}|${c.scale}|${c.rotate}|${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
+    return `${c.transform}|${c.translate}|${c.scale}|${c.rotate}|${r.left.toFixed(2)},${r.top.toFixed(2)},${r.width.toFixed(2)},${r.height.toFixed(2)}`;
   });
   const step = 50;
-  /** @type {number[]} */
-  const firstChange = els.map(() => -1);
-  /** @type {number[]} */
-  const lastChange = els.map(() => -1);
+  /** @type {boolean[][]} */
+  const changed = els.map(() => []);
   let prev = sample();
   for (let t = step; t <= 1000; t += step) {
     await new Promise((r) => setTimeout(r, step));
     const next = sample();
     next.forEach((v, i) => {
-      if (v !== prev[i]) {
-        if (firstChange[i] < 0) firstChange[i] = t;
-        lastChange[i] = t;
-      }
+      // Entering or leaving a marker ("hidden", "animated") is not movement.
+      changed[i].push(v !== prev[i] && !/^(hidden|animated)$/.test(v) && !/^(hidden|animated)$/.test(prev[i]));
     });
     prev = next;
   }
   const describe = (/** @type {Element} */ el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "");
   // Report the outermost moving element only: its children move with it.
-  const moving = els.filter((_, i) => firstChange[i] >= 0 && lastChange[i] - firstChange[i] + step > limit);
+  // A tween drawn at a low frame rate changes every other sample: gaps of up to two samples
+  // between changes still count as moving, gaps longer than that do not.
+  const movingTime = (/** @type {boolean[]} */ flags) => {
+    let total = 0;
+    let last = -Infinity;
+    flags.forEach((on, k) => {
+      if (!on) return;
+      total += k - last <= 3 ? (k - last) * step : step;
+      last = k;
+    });
+    return total;
+  };
+  const moving = els.filter((_, i) => movingTime(changed[i]) > limit);
   return moving.filter((el) => !moving.some((other) => other !== el && other.contains(el))).slice(0, 5).map(describe);
 }
 
@@ -514,13 +554,17 @@ async function renderedThaiFonts(page) {
   // only its Thai characters, laid out off screen in the same font, and that run is what is asked.
   await page.evaluate(() => {
     for (const el of document.querySelectorAll("[data-design-floor-thai]")) {
-      const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
+      // An input's text is what it shows: a button's label, or a text field's value, or its placeholder while empty.
+      const own = el instanceof HTMLInputElement ? (/^(submit|reset|button)$/.test(el.type) ? el.value
+        : /^(text|search|url|tel|email|number)$/.test(el.type) ? el.value || el.placeholder : "")
+        : [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
       const run = document.createElement("span");
       run.setAttribute("data-design-floor-thai-run", el.getAttribute("data-design-floor-thai") ?? "");
       run.setAttribute("aria-hidden", "true");
       // Copy the element's own font so the page's rules for spans (`p > span { font-family: … }`)
       // cannot give the probe a different one; !important also beats the page's !important rules.
-      const cs = getComputedStyle(el);
+      // A placeholder is drawn with the ::placeholder styles, which may set their own font.
+      const cs = getComputedStyle(el, el instanceof HTMLInputElement && !el.value ? "::placeholder" : null);
       for (const prop of ["font-family", "font-weight", "font-style", "font-stretch", "font-size", "font-variant",
         "font-feature-settings", "font-variation-settings", "font-synthesis", "font-kerning", "font-language-override"]) {
         const value = cs.getPropertyValue(prop);
@@ -531,9 +575,9 @@ async function renderedThaiFonts(page) {
       // Joined with nothing: a space between the pieces is drawn by the first font in the stack
       // (Geist, Inter...), which would read as a fallback although it draws no Thai.
       run.textContent = (own.match(/[\u0E00-\u0E7F]+/g) ?? []).join("");
-      // A child of a textarea, select or option is never rendered: lay the run out in <body>
+      // A child of an input, textarea, select or option is never rendered: lay the run out in <body>
       // instead, in the control's language, which steers Chromium's fallback choice.
-      if (el.matches("textarea, select, option, optgroup")) {
+      if (el.matches("input, textarea, select, option, optgroup")) {
         run.lang = /** @type {HTMLElement | null} */ (el.closest("[lang]"))?.lang ?? "";
         document.body.append(run);
       } else el.append(run);
@@ -722,11 +766,12 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
       // Scroll-triggered entrances start only here, so reveal the page under reduced motion too.
       await revealAll(page);
       await page.waitForTimeout(300);
-      for (const a of await page.evaluate(() => window.__designFloorMotion?.() ?? [])) {
-        findings.push(finding("reduced-motion", route, 390, a.el, `${a.name} runs ${a.iterations === Infinity ? "infinitely" : `${Math.round(Number(a.duration))} ms`} under reduced motion`));
-      }
+      // Sample script motion first: animations that start during the sample are then recorded too.
       for (const el of await page.evaluate(probeScriptedMotion, MOTION_LIMIT_MS)) {
         findings.push(finding("reduced-motion", route, 390, el, "moves from script (requestAnimationFrame or inline styles) under reduced motion"));
+      }
+      for (const a of await page.evaluate(() => window.__designFloorMotion?.() ?? [])) {
+        findings.push(finding("reduced-motion", route, 390, a.el, `${a.name} runs ${a.iterations === Infinity ? "infinitely" : `${Math.round(Number(a.duration))} ms`} under reduced motion`));
       }
       await ctx.close();
     }
