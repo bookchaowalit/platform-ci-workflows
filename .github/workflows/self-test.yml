@@ -112,6 +112,24 @@ jobs:
       typecheck-command: ""
       coverage-threshold: "80"
 
+  checker-typecheck:
+    # The vendored checker is type-checked here as upstream does (strict tsc --checkJs from its
+    # tsconfig.json); the design-floor job itself installs with --omit=dev and runs no tsc.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: design-floor
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - run: npm ci --no-audit --no-fund
+      - run: npx tsc -p .
+
   design-floor:
     # Runs the pinned checker against a static page that meets the floor (tests/fixtures/design-floor).
     # The checker's failure paths are tested where it lives, in architecture-docs/design-floor.

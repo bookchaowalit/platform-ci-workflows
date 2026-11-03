@@ -10,10 +10,12 @@ public reusable workflow cannot check out a private repository.
 | `check.mjs` (1.1.4) | `architecture-docs` @ `eb9dbca` | `02654b8bfa969620036223149861cae4ab425e8a97ae643d071c99b2d6fdf822` |
 | `package.json` | `architecture-docs` @ `439db24` (dev dependencies only: typescript, @types/node) | `87c6454671c60c2e4b33acbcaf3906c23256d4431566492c00bf235791d3628b` |
 | `package-lock.json` | `architecture-docs` @ `439db24` | `abf854f0d567bec018deb66da55c7760e17df7acfe4df6af2de5c7f24bfaf8d2` |
+| `tsconfig.json` | `architecture-docs` @ `eb9dbca` (type check only: self-test `checker-typecheck` runs `tsc`) | `9003e3c75014f7a193fee2de10b706520a516d57c00d6d5bfdf98f19ed521b03` |
+| `globals.d.ts` | `architecture-docs` @ `eb9dbca` | `8eadeb70f5e910cf7c940721607048547cb6a300a01cfc1540e1d8b26e206977` |
 
 Do not edit these files here. To update:
 
 1. Change and test the checker in `architecture-docs` (`npm test` in `design-floor/`).
-2. Copy the three files here unchanged, update this table, and commit that on its own.
+2. Copy these files here unchanged, update this table, and commit that on its own.
 3. Set `FLOOR_REF` in `design-floor.yml` to that commit's SHA in a second commit, and release a
    new minor version.
