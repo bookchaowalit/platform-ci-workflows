@@ -450,7 +450,16 @@ async function renderedThaiFonts(page) {
       const run = document.createElement("span");
       run.setAttribute("data-design-floor-thai-run", el.getAttribute("data-design-floor-thai") ?? "");
       run.setAttribute("aria-hidden", "true");
-      run.style.cssText = "position:absolute;left:-100000px;top:0;white-space:nowrap;visibility:visible";
+      // Copy the element's own font so the page's rules for spans (`p > span { font-family: … }`)
+      // cannot give the probe a different one; !important also beats the page's !important rules.
+      const cs = getComputedStyle(el);
+      for (const prop of ["font-family", "font-weight", "font-style", "font-stretch", "font-size", "font-variant",
+        "font-feature-settings", "font-variation-settings", "font-synthesis", "font-kerning", "font-language-override"]) {
+        const value = cs.getPropertyValue(prop);
+        if (value) run.style.setProperty(prop, value, "important");
+      }
+      for (const [prop, value] of [["position", "absolute"], ["left", "-100000px"], ["top", "0"], ["white-space", "nowrap"],
+        ["visibility", "visible"], ["display", "inline"]]) run.style.setProperty(prop, value, "important");
       // Joined with nothing: a space between the pieces is drawn by the first font in the stack
       // (Geist, Inter...), which would read as a fallback although it draws no Thai.
       run.textContent = (own.match(/[\u0E00-\u0E7F]+/g) ?? []).join("");
