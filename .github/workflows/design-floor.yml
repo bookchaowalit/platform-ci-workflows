@@ -4,7 +4,7 @@
 # Caller example (public repo, Next.js served by `next start` from design-floor.json):
 #   jobs:
 #     design-floor:
-#       uses: bookchaowalit/platform-ci-workflows/.github/workflows/design-floor.yml@<sha> # v1.5.7
+#       uses: bookchaowalit/platform-ci-workflows/.github/workflows/design-floor.yml@<sha> # v1.5.8
 #       with:
 #         build-command: npm run build
 #
@@ -67,8 +67,8 @@ permissions:
   contents: read
 
 env:
-  # design-floor/ at this commit holds the checker (check.mjs 1.1.7); see design-floor/SOURCE.md.
-  FLOOR_REF: 578a372803d5a09a701fad429f8ba037814518c4
+  # design-floor/ at this commit holds the checker (check.mjs 1.1.8); see design-floor/SOURCE.md.
+  FLOOR_REF: cc01a855e13c3f480c75e534325150ab49e8e72e
 
 jobs:
   floor:
