@@ -131,7 +131,7 @@ at the commit pinned by `FLOOR_REF`.
 
 ```yaml
   design-floor:
-    uses: bookchaowalit/platform-ci-workflows/.github/workflows/design-floor.yml@<sha> # v1.5.4
+    uses: bookchaowalit/platform-ci-workflows/.github/workflows/design-floor.yml@<sha> # v1.5.5
     with:
       build-command: npm run build
       # Optional: render what production renders, e.g. a consent banner behind a public flag.
