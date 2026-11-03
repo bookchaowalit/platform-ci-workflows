@@ -357,7 +357,9 @@ async function probeFocus() {
     skipTarget = !!(t && main && (t === main || t.contains(main) || t === main.firstElementChild || t === main.querySelector("h1")));
   }
   const key = el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + `@${Math.round(r.left)},${Math.round(r.top + scrollY)}`;
-  return { key, ring, transparent, covered, offscreen, isSkip: el.tagName === "A" && skipTarget, label: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent?.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "") };
+  // Tab moves inside a frame while the outer document keeps the <iframe> as its focus.
+  const inFrame = el.tagName === "IFRAME" || el.tagName === "FRAME";
+  return { key, ring, transparent, covered, offscreen, inFrame, isSkip: el.tagName === "A" && skipTarget, label: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent?.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "") };
 }
 
 // WCAG 2.3.3 covers motion: movement, scaling, rotation, size. Fades and
@@ -414,6 +416,42 @@ function recordMotion(limit) {
     return animation;
   };
   window.__designFloorMotion = () => { document.getAnimations().forEach(take); return found; };
+}
+
+// Motion driven from script (requestAnimationFrame loops, libraries that write inline styles)
+// is invisible to getAnimations(). Sample every element's transform and position for a second;
+// one that keeps changing for longer than the limit moves under reduced motion. Elements with a
+// CSS or Web Animation are left to recordMotion.
+/** @param {number} limit */
+async function probeScriptedMotion(limit) {
+  const els = [...document.body.querySelectorAll("*")].slice(0, 3000)
+    .filter((el) => el.getAnimations().length === 0);
+  const sample = () => els.map((el) => {
+    const c = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    return `${c.transform}|${c.translate}|${c.scale}|${c.rotate}|${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
+  });
+  const step = 50;
+  /** @type {number[]} */
+  const firstChange = els.map(() => -1);
+  /** @type {number[]} */
+  const lastChange = els.map(() => -1);
+  let prev = sample();
+  for (let t = step; t <= 1000; t += step) {
+    await new Promise((r) => setTimeout(r, step));
+    const next = sample();
+    next.forEach((v, i) => {
+      if (v !== prev[i]) {
+        if (firstChange[i] < 0) firstChange[i] = t;
+        lastChange[i] = t;
+      }
+    });
+    prev = next;
+  }
+  const describe = (/** @type {Element} */ el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "");
+  // Report the outermost moving element only: its children move with it.
+  const moving = els.filter((_, i) => firstChange[i] >= 0 && lastChange[i] - firstChange[i] + step > limit);
+  return moving.filter((el) => !moving.some((other) => other !== el && other.contains(el))).slice(0, 5).map(describe);
 }
 
 // Entrance animations (fades, slides) are measured mid-flight otherwise: axe
@@ -598,16 +636,21 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
           for (let i = 0; i < MAX_TAB_STOPS && state && !seen.has(state.key); i++) {
             seen.add(state.key);
             order.push(state.key);
-            if (!state.ring) findings.push(finding("focus-visible", route, width, state.label, state.transparent ? "focused element is transparent (opacity)" : "no outline or box-shadow while focused"));
+            // The ring of a control inside a frame is drawn in the frame's own document, which may be
+            // cross-origin; FLOOR.md lists frame content as a manual check.
+            if (!state.ring && !state.inFrame) findings.push(finding("focus-visible", route, width, state.label, state.transparent ? "focused element is transparent (opacity)" : "no outline or box-shadow while focused"));
             if (state.covered) findings.push(finding("focus-not-obscured", route, width, state.label, state.offscreen ? "focused element is outside the viewport" : "focused element is fully covered"));
             let next = null;
             let stuck = 0;
-            for (; stuck < 3; stuck++) {
+            // Inside a frame, Tab walks the frame's own controls first: give it the full stop
+            // budget to come back out before calling it stuck.
+            const limit = state.inFrame ? MAX_TAB_STOPS : 3;
+            for (; stuck < limit; stuck++) {
               await page.keyboard.press("Tab");
               next = await page.evaluate(probeFocus);
               if (!next || next.key !== state.key) break;
             }
-            if (stuck === 3) {
+            if (stuck === limit) {
               // As with a cycle below: a control that holds Tab on purpose may let Escape out.
               await page.keyboard.press("Escape");
               await page.keyboard.press("Tab");
@@ -656,6 +699,9 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
       await page.waitForTimeout(300);
       for (const a of await page.evaluate(() => window.__designFloorMotion?.() ?? [])) {
         findings.push(finding("reduced-motion", route, 390, a.el, `${a.name} runs ${a.iterations === Infinity ? "infinitely" : `${Math.round(Number(a.duration))} ms`} under reduced motion`));
+      }
+      for (const el of await page.evaluate(probeScriptedMotion, MOTION_LIMIT_MS)) {
+        findings.push(finding("reduced-motion", route, 390, el, "moves from script (requestAnimationFrame or inline styles) under reduced motion"));
       }
       await ctx.close();
     }
