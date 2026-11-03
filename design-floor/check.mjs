@@ -31,6 +31,7 @@ const AXE_TAGS =["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 const HEIGHT = 900;
 const MAX_TAB_STOPS = 40;
 const MOTION_LIMIT_MS = 200;
+const MAX_SCROLL_STEPS = 60; // an infinite feed keeps growing; stop revealing after this many screens
 
 const MIME = {
   ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript",
@@ -160,17 +161,24 @@ function probeTypography() {
     if (cs.visibility !== "visible" || !(box ?? document.body).checkVisibility()) continue;
     if (out.thaiElements < 30) el.setAttribute("data-design-floor-thai", describe(el));
     out.thaiElements++;
-    // Leading matters where Thai lines stack: only non-inline boxes that wrap to
-    // two or more lines (inline boxes inherit the line box of their block).
+    // Leading matters where Thai lines stack: boxes whose text wraps to two or
+    // more lines. An inline box sits in the line box of its block, which is at
+    // least as tall as the block's own line-height, so it counts the taller one.
     const size = parseFloat(cs.fontSize);
-    const lh = cs.lineHeight === "normal" ? 1.2 : parseFloat(cs.lineHeight) / size;
-    const heading = /^H[1-6]$/.test(el.tagName) || size >= 24;
+    const lhPxOf = (c) => (c.lineHeight === "normal" ? 1.2 * parseFloat(c.fontSize) : parseFloat(c.lineHeight));
+    let lhPx = lhPxOf(cs);
+    if (cs.display === "inline") {
+      let block = el.parentElement;
+      while (block && ["inline", "contents"].includes(getComputedStyle(block).display)) block = block.parentElement;
+      if (block) lhPx = Math.max(lhPx, lhPxOf(getComputedStyle(block)));
+    }
+    const lh = lhPx / size;
+    const heading = !!el.closest("h1, h2, h3, h4, h5, h6") || size >= 24;
     const min = heading ? 1.3 : 1.6;
-    if (lh + 1e-6 < min && cs.display !== "inline") {
+    if (lh + 1e-6 < min) {
       // Count text lines from the element's text nodes only (icons and
       // badges inside an inline-flex row are not lines), clustering line
       // boxes whose tops are closer than half a line apart.
-      const lhPx = lh * size;
       const tops = [];
       const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
@@ -203,25 +211,70 @@ function probeTargets() {
     const r = el.getBoundingClientRect();
     if (r.width <= 1 && r.height <= 1) continue; // not shown (e.g. sr-only skip link before focus)
     if (r.width >= 24 && r.height >= 24) continue;
-    if (el.tagName === "A" && cs.display === "inline") {
-      const parentText = (el.parentElement?.textContent ?? "").trim();
-      if (parentText.length > el.textContent.trim().length + 10) continue; // inline exception
+    // Inline exception (2.5.8): a link inside a sentence. Only the parent's own
+    // words count, not the text of sibling links, so a row of links joined by
+    // separators is not a sentence however long it is.
+    if (el.tagName === "A" && cs.display === "inline" && el.parentElement) {
+      const words = [...el.parentElement.childNodes]
+        .filter((n) => n.nodeType === 3 || (n.nodeType === 1 && !n.matches(sel) && !n.querySelector(sel)))
+        .map((n) => n.textContent).join("");
+      if ((words.match(/\p{L}/gu) ?? []).length >= 3) continue;
     }
     bad.push({ el: describe(el), detail: `${Math.round(r.width)}×${Math.round(r.height)} px` });
   }
   return bad;
 }
 
-function probeFocus() {
+// Records each focusable element's outline and box-shadow before any Tab, so
+// probeFocus can tell a focus indicator from a shadow the element always has.
+function probeRestStyles() {
+  const rest = new WeakMap();
+  for (const el of document.querySelectorAll("*")) {
+    const cs = getComputedStyle(el);
+    rest.set(el, { outline: `${cs.outlineStyle} ${cs.outlineWidth} ${cs.outlineColor}`, shadow: cs.boxShadow });
+  }
+  window.__designFloorRest = rest;
+}
+
+async function probeFocus() {
   const el = document.activeElement;
   if (!el || el === document.body) return null;
+  // Read the settled state: a focus ring under `transition-all` starts transparent, and
+  // `scroll-behavior: smooth` is still bringing the element into view right after Tab.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  await Promise.race([
+    Promise.all(el.getAnimations().filter((a) => a.effect?.getComputedTiming?.().iterations !== Infinity).map((a) => a.finished.catch(() => {}))),
+    sleep(1000),
+  ]);
+  const pos = () => { const b = el.getBoundingClientRect(); return `${b.left},${b.top}`; };
+  for (let i = 0, last = pos(), still = 0; i < 30 && still < 3; i++) {
+    await sleep(50);
+    const now = pos();
+    still = now === last ? still + 1 : 0;
+    last = now;
+  }
   const cs = getComputedStyle(el);
-  const ring = (cs.outlineStyle !== "none" && parseFloat(cs.outlineWidth) > 0) || (cs.boxShadow && cs.boxShadow !== "none");
+  // A fully transparent colour paints nothing (Tailwind's outline-hidden, the 0 0 #0000 ring reset).
+  const clear = (c) => c === "transparent" || /^rgba\([^)]*,\s*0(\.0+)?\)$|\/\s*0(\.0+)?\)$/.test(c.trim());
+  const shadows = cs.boxShadow === "none" ? [] : cs.boxShadow.split(/,(?![^(]*\))/);
+  const paints = (p) => {
+    const color = p.match(/(rgba?|hsla?|oklch|oklab|lab|lch|color)\([^)]*\)/)?.[0] ?? "";
+    return !(color && clear(color)) && /[1-9]/.test(p.replace(color, ""));
+  };
+  const outline = `${cs.outlineStyle} ${cs.outlineWidth} ${cs.outlineColor}`;
+  const rest = window.__designFloorRest?.get(el) ?? { outline: "", shadow: "" };
+  const outlineRing = cs.outlineStyle !== "none" && parseFloat(cs.outlineWidth) > 0 && !clear(cs.outlineColor) && outline !== rest.outline;
+  const shadowRing = shadows.some(paints) && cs.boxShadow !== rest.shadow;
+  const ring = outlineRing || shadowRing;
   const r = el.getBoundingClientRect();
   const pts = [[0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]].map(([x, y]) => [r.left + r.width * x, r.top + r.height * y]);
-  const covered = pts.every(([x, y]) => {
-    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return false;
-    const hit = document.elementFromPoint(x, y);
+  // The browser scrolls a focused element into view, so a point still outside
+  // the viewport is one nobody can see; it counts as hidden like a covered one.
+  const outside = ([x, y]) => x < 0 || y < 0 || x >= innerWidth || y >= innerHeight;
+  const offscreen = pts.every(outside);
+  const covered = pts.every((p) => {
+    if (outside(p)) return true;
+    const hit = document.elementFromPoint(p[0], p[1]);
     return hit && hit !== el && !el.contains(hit) && !hit.contains(el);
   });
   // A skip link points at the main content: <main>/[role=main] itself, an
@@ -234,30 +287,37 @@ function probeFocus() {
     skipTarget = !!(t && main && (t === main || t.contains(main) || t === main.firstElementChild || t === main.querySelector("h1")));
   }
   const key = el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + `@${Math.round(r.left)},${Math.round(r.top + scrollY)}`;
-  return { key, ring, covered, isSkip: el.tagName === "A" && skipTarget, label: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "") };
+  return { key, ring, covered, offscreen, isSkip: el.tagName === "A" && skipTarget, label: el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.textContent.trim() ? ` "${el.textContent.trim().slice(0, 30)}"` : "") };
 }
 
 // WCAG 2.3.3 covers motion: movement, scaling, rotation, size. Fades and
 // colour changes are not motion, so animations that only touch those pass.
-function probeMotion({ limit }) {
+// Runs as an init script: CSS animations and transitions are recorded as they
+// start, so one that is over before the probe reads the page still counts.
+function recordMotion(limit) {
   // Any *-color property counts as colour: getKeyframes() expands shorthands into longhands
   // (border-color -> borderTopColor...) and names them in camelCase; transitionProperty is hyphenated.
   const quiet = /^(opacity|fill|stroke|visibility|offset|easing|composite|computed-offset|([a-z]+-)*color)$/i;
   const hyphenate = (p) => p.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
-  return document.getAnimations()
-    .filter((a) => a.playState === "running")
-    .filter((a) => {
-      const frames = a.effect?.getKeyframes?.() ?? [];
-      const props = new Set(frames.flatMap((f) => Object.keys(f)));
-      if (a.transitionProperty) props.add(a.transitionProperty);
-      return [...props].some((p) => !quiet.test(hyphenate(p)));
-    })
-    .map((a) => {
-      const t = a.effect?.getComputedTiming?.() ?? {};
-      const target = a.effect?.target;
-      return { name: a.animationName ?? a.transitionProperty ?? a.constructor.name, duration: t.duration, iterations: t.iterations, el: target ? target.tagName.toLowerCase() + (target.id ? `#${target.id}` : "") : "?" };
-    })
-    .filter((a) => a.iterations === Infinity || (typeof a.duration === "number" && a.duration > limit));
+  const seen = new WeakSet();
+  const found = [];
+  const take = (a) => {
+    if (seen.has(a) || a.playState !== "running") return;
+    seen.add(a);
+    const frames = a.effect?.getKeyframes?.() ?? [];
+    const props = new Set(frames.flatMap((f) => Object.keys(f)));
+    if (a.transitionProperty) props.add(a.transitionProperty);
+    if (![...props].some((p) => !quiet.test(hyphenate(p)))) return;
+    const t = a.effect?.getComputedTiming?.() ?? {};
+    if (!(t.iterations === Infinity || (typeof t.duration === "number" && t.duration > limit))) return;
+    const target = a.effect?.target;
+    found.push({ name: a.animationName ?? a.transitionProperty ?? a.constructor.name, duration: t.duration, iterations: t.iterations, el: target ? target.tagName.toLowerCase() + (target.id ? `#${target.id}` : "") : "?" });
+  };
+  for (const type of ["animationstart", "transitionstart"]) {
+    addEventListener(type, (e) => e.target.getAnimations?.().forEach(take), true);
+  }
+  // Web Animations started from script (element.animate) fire no event: read them at probe time.
+  window.__designFloorMotion = () => { document.getAnimations().forEach(take); return found; };
 }
 
 // Entrance animations (fades, slides) are measured mid-flight otherwise: axe
@@ -266,14 +326,14 @@ function probeMotion({ limit }) {
 // below-the-fold content transparent, and axe skips transparent text. Scroll
 // the page through once so everything is revealed, then return to the top.
 async function revealAll(page) {
-  await page.evaluate(async () => {
+  await page.evaluate(async (maxSteps) => {
     const step = Math.max(200, Math.floor(innerHeight * 0.8));
-    for (let y = 0; y < document.documentElement.scrollHeight; y += step) {
+    for (let y = 0, i = 0; y < document.documentElement.scrollHeight && i < maxSteps; y += step, i++) {
       scrollTo(0, y);
       await new Promise((r) => setTimeout(r, 60));
     }
     scrollTo(0, 0);
-  });
+  }, MAX_SCROLL_STEPS);
 }
 
 // JS-driven animation (framer-motion, GSAP) is invisible to getAnimations(),
@@ -328,11 +388,19 @@ async function renderedThaiFonts(page) {
 
 function finding(rule, route, width, el, detail) { return { rule, route, width, el, detail }; }
 
-export async function runChecks(cfg, { shots } = {}) {
+// axe rules that check a floor row of their own report under that row, so its waiver covers them.
+export function axeRule(id) {
+  if (id === "color-contrast") return "contrast";
+  if (id === "target-size") return "target-size";
+  return AXE_LANG_RULES.has(id) ? "lang" : "axe";
+}
+
+export async function runChecks(cfg, { shots, launch = () => chromium.launch() } = {}) {
   const target = await startTarget(cfg);
-  const browser = await chromium.launch();
+  let browser;
   const findings = [];
   try {
+    browser = await launch();
     for (const [index, { path: route, status: expected }] of cfg.routes.entries()) {
       const url = new URL(route, target.url).href;
 
@@ -352,7 +420,7 @@ export async function runChecks(cfg, { shots } = {}) {
         if (width === 390 || width === 1440) {
           const axe = await new AxeBuilder({ page }).withTags(AXE_TAGS).analyze();
           for (const v of axe.violations) {
-            const rule = v.id === "color-contrast" ? "contrast" : AXE_LANG_RULES.has(v.id) ? "lang" : "axe";
+            const rule = axeRule(v.id);
             for (const n of v.nodes.slice(0, 5)) findings.push(finding(rule, route, width, n.target.join(" "), `${v.id}: ${v.help}`));
           }
         }
@@ -368,6 +436,7 @@ export async function runChecks(cfg, { shots } = {}) {
         }
 
         if (width === 1440) {
+          await page.evaluate(probeRestStyles);
           await page.keyboard.press("Tab");
           const first = await page.evaluate(probeFocus);
           if (!first?.isSkip) findings.push(finding("skip-link", route, width, first?.label ?? "(nothing focused)", "first Tab stop is not a skip link to an existing target"));
@@ -376,7 +445,7 @@ export async function runChecks(cfg, { shots } = {}) {
           for (let i = 0; i < MAX_TAB_STOPS && state && !seen.has(state.key); i++) {
             seen.add(state.key);
             if (!state.ring) findings.push(finding("focus-visible", route, width, state.label, "no outline or box-shadow while focused"));
-            if (state.covered) findings.push(finding("focus-not-obscured", route, width, state.label, "focused element is fully covered"));
+            if (state.covered) findings.push(finding("focus-not-obscured", route, width, state.label, state.offscreen ? "focused element is outside the viewport" : "focused element is fully covered"));
             let next = null;
             let stuck = 0;
             for (; stuck < 3; stuck++) {
@@ -385,7 +454,10 @@ export async function runChecks(cfg, { shots } = {}) {
               if (!next || next.key !== state.key) break;
             }
             if (stuck === 3) { findings.push(finding("keyboard-trap", route, width, state.label, "focus did not move after 3 Tabs")); break; }
-            state = next; // a key already seen means focus wrapped around: the loop ends
+            // Focus that returns to the first stop wrapped around the page; back to any
+            // other stop it already visited, it circles a subset it cannot leave.
+            if (next && seen.has(next.key) && next.key !== first.key) { findings.push(finding("keyboard-trap", route, width, next.label, "focus cycles through a group of elements it cannot leave")); break; }
+            state = next;
           }
         }
 
@@ -400,16 +472,18 @@ export async function runChecks(cfg, { shots } = {}) {
       }
 
       const ctx = await browser.newContext({ viewport: { width: 390, height: HEIGHT }, reducedMotion: "reduce" });
+      await ctx.addInitScript(recordMotion, MOTION_LIMIT_MS);
       const page = await ctx.newPage();
       await page.goto(url, { waitUntil: "load" });
       await page.waitForTimeout(300);
-      for (const a of await page.evaluate(probeMotion, { limit: MOTION_LIMIT_MS })) {
+      for (const a of await page.evaluate(() => window.__designFloorMotion())) {
         findings.push(finding("reduced-motion", route, 390, a.el, `${a.name} runs ${a.iterations === Infinity ? "infinitely" : `${Math.round(a.duration)} ms`} under reduced motion`));
       }
       await ctx.close();
     }
   } finally {
-    await browser.close();
+    // Stop the target even when Chromium never launched, or a served app outlives the run.
+    await browser?.close();
     await target.stop();
   }
   return findings;
