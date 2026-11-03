@@ -377,8 +377,9 @@ function recordMotion(limit) {
   const found = [];
   /** @param {Animation & { animationName?: string, transitionProperty?: string }} a CSSAnimation or CSSTransition */
   const take = (a) => {
+    // Only a reported animation is remembered: one that passed may be retimed later
+    // (updateTiming to infinite iterations) and is read again at probe time.
     if (seen.has(a) || a.playState !== "running") return;
-    seen.add(a);
     const effect = /** @type {KeyframeEffect | null} */ (a.effect);
     const frames = effect?.getKeyframes?.() ?? [];
     // Only properties whose value changes count: a fade that also repeats one `transform` at
@@ -400,6 +401,7 @@ function recordMotion(limit) {
     // activeDuration covers every iteration: ten 150 ms slides are 1.5 s of motion.
     const total = typeof t.activeDuration === "number" ? t.activeDuration : t.duration;
     if (!(t.iterations === Infinity || (typeof total === "number" && total > limit))) return;
+    seen.add(a);
     const target = effect?.target;
     found.push({ name: a.animationName ?? a.transitionProperty ?? a.constructor.name, duration: total, iterations: t.iterations, el: target ? target.tagName.toLowerCase() + (target.id ? `#${target.id}` : "") : "?" });
   };
@@ -529,7 +531,12 @@ async function renderedThaiFonts(page) {
       // Joined with nothing: a space between the pieces is drawn by the first font in the stack
       // (Geist, Inter...), which would read as a fallback although it draws no Thai.
       run.textContent = (own.match(/[\u0E00-\u0E7F]+/g) ?? []).join("");
-      el.append(run);
+      // A child of a textarea, select or option is never rendered: lay the run out in <body>
+      // instead, in the control's language, which steers Chromium's fallback choice.
+      if (el.matches("textarea, select, option, optgroup")) {
+        run.lang = /** @type {HTMLElement | null} */ (el.closest("[lang]"))?.lang ?? "";
+        document.body.append(run);
+      } else el.append(run);
     }
   });
   const cdp = await page.context().newCDPSession(page);
@@ -633,13 +640,29 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
           let state = first;
           const seen = new Set();
           const order = [];
+          // Stops already judged for focus-visible/obscured, kept across an Escape that restarts the walk.
+          const judged = new Set();
+          let escapes = 0;
+          // After Escape lets focus out of a dialog or a control that held Tab, the walk carries on
+          // from where focus landed, so the controls after it are still checked (up to 3 times).
+          /** @param {typeof first} after */
+          const resume = (after) => {
+            if (!after || escapes >= 3) return false;
+            escapes++;
+            seen.clear();
+            order.length = 0;
+            state = after;
+            return true;
+          };
           for (let i = 0; i < MAX_TAB_STOPS && state && !seen.has(state.key); i++) {
             seen.add(state.key);
             order.push(state.key);
+            const fresh = !judged.has(state.key);
+            judged.add(state.key);
             // The ring of a control inside a frame is drawn in the frame's own document, which may be
             // cross-origin; FLOOR.md lists frame content as a manual check.
-            if (!state.ring && !state.inFrame) findings.push(finding("focus-visible", route, width, state.label, state.transparent ? "focused element is transparent (opacity)" : "no outline or box-shadow while focused"));
-            if (state.covered) findings.push(finding("focus-not-obscured", route, width, state.label, state.offscreen ? "focused element is outside the viewport" : "focused element is fully covered"));
+            if (fresh && !state.ring && !state.inFrame) findings.push(finding("focus-visible", route, width, state.label, state.transparent ? "focused element is transparent (opacity)" : "no outline or box-shadow while focused"));
+            if (fresh && state.covered) findings.push(finding("focus-not-obscured", route, width, state.label, state.offscreen ? "focused element is outside the viewport" : "focused element is fully covered"));
             let next = null;
             let stuck = 0;
             // Inside a frame, Tab walks the frame's own controls first: give it the full stop
@@ -656,6 +679,7 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
               await page.keyboard.press("Tab");
               const after = await page.evaluate(probeFocus);
               if (after && after.key === state.key) findings.push(finding("keyboard-trap", route, width, state.label, "focus did not move after 3 Tabs or Escape"));
+              else if (resume(after)) continue;
               break;
             }
             // Focus back on a stop it already visited, without passing through the page
@@ -674,6 +698,7 @@ export async function runChecks(cfg, { shots, launch = () => chromium.launch() }
               await page.keyboard.press("Tab");
               const after = await page.evaluate(probeFocus);
               if (after && cycle.has(after.key)) findings.push(finding("keyboard-trap", route, width, next.label, "focus cycles through a group of elements that Escape does not leave"));
+              else if (resume(after)) continue;
               break;
             }
             state = next;
