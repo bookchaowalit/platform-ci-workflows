@@ -11,7 +11,7 @@ get no CI/CD.
 | [`security.yml`](.github/workflows/security.yml) | Gitleaks, Semgrep CE, OSV-Scanner, Trivy fs (vuln + IaC misconfig) |
 | [`deploy-railway.yml`](.github/workflows/deploy-railway.yml) | CD after CI passes on `main`: `mode: verify` (v1.3.0) waits for the deployment Railway makes itself and checks it, read-only; `mode: deploy` (v1.2.0) asks Railway to deploy that exact commit. Both smoke-test (health + commit) and fail loudly with a rollback command |
 | [`deploy-vercel.yml`](.github/workflows/deploy-vercel.yml) | The same for a Vercel project, through the REST API with `gitSource` at the commit SHA (no CLI, no upload). Not adopted yet: needs the owner's OK under D9 |
-| [`design-floor.yml`](.github/workflows/design-floor.yml) | ADR-0007 design floor: builds the app, then runs the pinned checker (WCAG 2.2 AA floor, Thai typography, five widths) against its `design-floor.json`; report and screenshots as an artifact. Opt-in (v1.4.0) |
+| [`design-floor.yml`](.github/workflows/design-floor.yml) | ADR-0007 design floor: builds the app, then runs the pinned checker (WCAG 2.2 AA floor, Thai typography, five widths) against its `design-floor.json`; report and screenshots as an artifact. Opt-in (v1.4.0; checker 1.1.0 since v1.5.0) |
 
 Everything runs as pinned binaries or pinned packages, without Docker, so the same workflows
 run on GitHub-hosted runners and on the Railway self-hosted runner.
@@ -131,7 +131,7 @@ at the commit pinned by `FLOOR_REF`.
 
 ```yaml
   design-floor:
-    uses: bookchaowalit/platform-ci-workflows/.github/workflows/design-floor.yml@<sha> # v1.4.0
+    uses: bookchaowalit/platform-ci-workflows/.github/workflows/design-floor.yml@<sha> # v1.5.0
     with:
       build-command: npm run build
       # Optional: render what production renders, e.g. a consent banner behind a public flag.
@@ -146,6 +146,10 @@ at the commit pinned by `FLOOR_REF`.
   (banners behind a flag) are the usual cause of a floor that passes in CI and fails live.
 - Still run the check against the deployed URL after a deploy (`target.url`): CI cannot see the
   edge, real environment variables or third-party widgets.
+- v1.5.0 carries checker 1.1.0, whose rules are stricter than 1.0.3 (focus indicators compared
+  with the resting state, off-viewport focus, focus cycles, short motion under reduced motion,
+  inline Thai leading, link rows). An app that passed v1.4.x can fail on upgrade; the
+  `CHANGELOG.md` of `architecture-docs/design-floor/` lists each change.
 - Private repositories: the Railway runner image does not carry Chromium's libraries yet, so
   they keep the local report (ADR-0007 D-9) until it does; then pass the Railway `runner` and
   `install-browser-deps: false`.
