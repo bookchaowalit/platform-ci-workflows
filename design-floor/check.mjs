@@ -206,13 +206,13 @@ function probeTypography() {
   const describe = (/** @type {Element} */ el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") + (el.className && typeof el.className === "string" ? "." + el.className.trim().split(/\s+/).join(".") : "");
   // <body> itself can hold Thai text directly, so it is checked with its descendants.
   for (const el of [document.body, ...document.body.querySelectorAll("*")]) {
-    // An input's text is what it shows: a button's label, or a text field's value, or its placeholder while empty.
-    const own = el instanceof HTMLInputElement ? (/^(submit|reset|button)$/.test(el.type) ? el.value
+    // A form control's text is what it shows: a button's label, or a text field's or textarea's value, or its placeholder while empty.
+    const own = el instanceof HTMLTextAreaElement ? el.value || el.placeholder : el instanceof HTMLInputElement ? (/^(submit|reset|button)$/.test(el.type) ? el.value
         : /^(text|search|url|tel|email|number)$/.test(el.type) ? el.value || el.placeholder : "")
       : [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
     if (!thai.test(own)) continue;
     // A shown placeholder has its own ::placeholder styles (letter-spacing included).
-    const cs = getComputedStyle(el, el instanceof HTMLInputElement && !el.value ? "::placeholder" : null);
+    const cs = getComputedStyle(el, (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && !el.value ? "::placeholder" : null);
     // The element's own visibility is authoritative (it inherits, and a child may set it back to
     // visible). checkVisibility() covers a display:none ancestor; display:contents elements have no
     // box of their own, so ask the nearest ancestor that has one.
@@ -454,17 +454,31 @@ async function probeScriptedMotion(limit) {
         || new Set(frames.filter((f) => p in f).map((f) => String(/** @type {Record<string, unknown>} */ (f)[p]))).size > 1));
   };
   // Boxes are compared to 0.01 px: a slow drift moves less than a pixel between samples.
-  const sample = () => els.map((el) => {
+  const sample = () => {
+    // Elements under a finite moving CSS or Web Animation, themselves or through an ancestor,
+    // are timed exactly by recordMotion (200 ms is allowed), so their movement is not counted here.
+    const animated = new Set(document.getAnimations().filter((a) => a.playState === "running"
+      && a.effect?.getComputedTiming().iterations !== Infinity
+      && moves(/** @type {KeyframeEffect} */ (a.effect).getKeyframes()))
+      .map((a) => /** @type {KeyframeEffect} */ (a.effect).target).filter((t) => t instanceof Element));
+    return els.map((el) => {
     if (!el.checkVisibility()) return "hidden";
-    // A finite CSS or Web Animation is timed exactly by recordMotion (200 ms is allowed): while one
-    // runs, the element's movement is not counted here. Infinite ones (a colour pulse) are sampled.
-    // Only an animation that moves something counts: a finite fade or colour change does not hide script motion.
-    if (el.getAnimations().some((a) => a.playState === "running" && a.effect?.getComputedTiming().iterations !== Infinity
-      && moves(/** @type {KeyframeEffect} */ (a.effect).getKeyframes()))) return "animated";
+    // The element itself is animated: left to recordMotion. Under an animated ancestor, any box
+    // reading moves with the ancestor (its transform, or its own animated size and position), so
+    // only what script motion writes is read: the element's own transform and its inline geometry.
+    if (animated.has(el)) return "animated";
+    let under = false;
+    for (let up = el.parentElement; up && !under; up = up.parentElement) under = animated.has(up);
     const c = getComputedStyle(el);
+    const own = `${c.transform}|${c.translate}|${c.scale}|${c.rotate}`;
+    if (under) {
+      const st = /** @type {HTMLElement} */ (el).style;
+      return `inline|${own}|${st ? [st.left, st.top, st.right, st.bottom, st.inset, st.width, st.height, st.margin, st.marginLeft, st.marginTop].join(",") : ""}`;
+    }
     const r = el.getBoundingClientRect();
-    return `${c.transform}|${c.translate}|${c.scale}|${c.rotate}|${r.left.toFixed(2)},${r.top.toFixed(2)},${r.width.toFixed(2)},${r.height.toFixed(2)}`;
-  });
+    return `box|${own}|${r.left.toFixed(2)},${r.top.toFixed(2)},${r.width.toFixed(2)},${r.height.toFixed(2)}`;
+    });
+  };
   const step = 50;
   /** @type {boolean[][]} */
   const changed = els.map(() => []);
@@ -474,23 +488,29 @@ async function probeScriptedMotion(limit) {
     const next = sample();
     next.forEach((v, i) => {
       // Entering or leaving a marker ("hidden", "animated") is not movement.
-      changed[i].push(v !== prev[i] && !/^(hidden|animated)$/.test(v) && !/^(hidden|animated)$/.test(prev[i]));
+      // Switching between a marker or between the two ways of reading the box is not movement.
+      const kind = (/** @type {string} */ x) => x.split("|")[0];
+      changed[i].push(v !== prev[i] && !/^(hidden|animated)$/.test(v) && !/^(hidden|animated)$/.test(prev[i]) && kind(v) === kind(prev[i]));
     });
     prev = next;
   }
   const describe = (/** @type {Element} */ el) => el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "");
   // Report the outermost moving element only: its children move with it.
   // A tween drawn at a low frame rate changes every other sample: gaps of up to two samples
-  // between changes still count as moving, gaps longer than that do not.
+  // between changes still count as one run, a longer gap ends it. The longest run is the
+  // motion's duration (two separate short moves are not added up), less one sample, because a
+  // run of n changed samples spans between (n - 1) and n sample steps.
   const movingTime = (/** @type {boolean[]} */ flags) => {
-    let total = 0;
+    let longest = 0;
+    let run = 0;
     let last = -Infinity;
     flags.forEach((on, k) => {
       if (!on) return;
-      total += k - last <= 3 ? (k - last) * step : step;
+      run = k - last <= 3 ? run + (k - last) * step : step;
+      longest = Math.max(longest, run - step);
       last = k;
     });
-    return total;
+    return longest;
   };
   const moving = els.filter((_, i) => movingTime(changed[i]) > limit);
   return moving.filter((el) => !moving.some((other) => other !== el && other.contains(el))).slice(0, 5).map(describe);
@@ -554,8 +574,8 @@ async function renderedThaiFonts(page) {
   // only its Thai characters, laid out off screen in the same font, and that run is what is asked.
   await page.evaluate(() => {
     for (const el of document.querySelectorAll("[data-design-floor-thai]")) {
-      // An input's text is what it shows: a button's label, or a text field's value, or its placeholder while empty.
-      const own = el instanceof HTMLInputElement ? (/^(submit|reset|button)$/.test(el.type) ? el.value
+      // A form control's text is what it shows: a button's label, or a text field's or textarea's value, or its placeholder while empty.
+      const own = el instanceof HTMLTextAreaElement ? el.value || el.placeholder : el instanceof HTMLInputElement ? (/^(submit|reset|button)$/.test(el.type) ? el.value
         : /^(text|search|url|tel|email|number)$/.test(el.type) ? el.value || el.placeholder : "")
         : [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("");
       const run = document.createElement("span");
@@ -564,7 +584,7 @@ async function renderedThaiFonts(page) {
       // Copy the element's own font so the page's rules for spans (`p > span { font-family: … }`)
       // cannot give the probe a different one; !important also beats the page's !important rules.
       // A placeholder is drawn with the ::placeholder styles, which may set their own font.
-      const cs = getComputedStyle(el, el instanceof HTMLInputElement && !el.value ? "::placeholder" : null);
+      const cs = getComputedStyle(el, (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && !el.value ? "::placeholder" : null);
       for (const prop of ["font-family", "font-weight", "font-style", "font-stretch", "font-size", "font-variant",
         "font-feature-settings", "font-variation-settings", "font-synthesis", "font-kerning", "font-language-override"]) {
         const value = cs.getPropertyValue(prop);
