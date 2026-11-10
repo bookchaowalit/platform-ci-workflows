@@ -70,11 +70,16 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Image name
+      - name: Image and report names
         env:
           REPO: ${{ github.event.repository.name }}
-        # Docker image names must be lower case.
-        run: echo "IMAGE=image-scan/${REPO,,}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        # Docker image names must be lower case. The report name is unique per Dockerfile, so a
+        # caller that scans several images in one run gets one artifact per image.
+        run: |
+          echo "IMAGE=image-scan/${REPO,,}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+          slug=$(printf '%s' "$DOCKERFILE" | tr -c 'A-Za-z0-9._-' '-' | tr '[:upper:]' '[:lower:]')
+          echo "REPORT=trivy-image-${slug}" >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -141,7 +146,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: trivy-image-sarif
+          name: ${{ env.REPORT }}
           path: |
             ${{ runner.temp }}/trivy-image.sarif
             ${{ runner.temp }}/trivy-image.json
