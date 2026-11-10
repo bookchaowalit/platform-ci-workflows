@@ -47,6 +47,11 @@ on:
         description: Skip vulnerabilities that have no fixed version yet.
         type: boolean
         default: true
+      fail-on-findings:
+        description: Fail the job on findings. false = report only (job summary + SARIF artifact), used while a
+          repository fixes its base image; a red image job would otherwise block Railway's "Wait for CI" deploys.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -113,19 +118,33 @@ jobs:
           TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
           SEVERITY: ${{ inputs.severity }}
           IGNORE_UNFIXED: ${{ inputs.ignore-unfixed }}
+          FAIL: ${{ inputs.fail-on-findings }}
         run: |
           common=(image --input "$RUNNER_TEMP/image.tar" --scanners vuln --severity "$SEVERITY")
           if [ "$IGNORE_UNFIXED" = true ]; then common+=(--ignore-unfixed); fi
           if [ -f .trivyignore.yaml ]; then common+=(--ignorefile .trivyignore.yaml); fi
           trivy "${common[@]}" --format sarif --output "$RUNNER_TEMP/trivy-image.sarif"
-          trivy "${common[@]}" --skip-db-update --format table --exit-code 1
+          trivy "${common[@]}" --skip-db-update --format json --output "$RUNNER_TEMP/trivy-image.json"
+          # Counts per severity for the job summary (report-only callers read it there).
+          python3 - "$RUNNER_TEMP/trivy-image.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import collections, json, sys
+          data = json.load(open(sys.argv[1]))
+          counts = collections.Counter(v["Severity"] for r in data.get("Results") or [] for v in r.get("Vulnerabilities") or [])
+          total = sum(counts.values())
+          print("### Image scan")
+          print(f"{total} fixable finding(s): " + ", ".join(f"{k} {counts[k]}" for k in ("CRITICAL", "HIGH") if counts[k]) if total else "No fixable HIGH/CRITICAL findings.")
+          PY
+          code=1; [ "$FAIL" = true ] || code=0
+          trivy "${common[@]}" --skip-db-update --format table --exit-code "$code"
 
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: trivy-image-sarif
-          path: ${{ runner.temp }}/trivy-image.sarif
+          path: |
+            ${{ runner.temp }}/trivy-image.sarif
+            ${{ runner.temp }}/trivy-image.json
           if-no-files-found: ignore
           retention-days: 14
 
