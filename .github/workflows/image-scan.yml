@@ -77,8 +77,10 @@ jobs:
         # Docker image names must be lower case. The report name is unique per Dockerfile, so a
         # caller that scans several images in one run gets one artifact per image.
         run: |
-          echo "IMAGE=image-scan/${REPO,,}:${GITHUB_SHA}" >> "$GITHUB_ENV"
           slug=$(printf '%s' "$DOCKERFILE" | tr -c 'A-Za-z0-9._-' '-' | tr '[:upper:]' '[:lower:]')
+          # Unique per run, attempt and Dockerfile: the homelab runners share one podman store, so
+          # concurrent jobs must never tag (or clean up) the same image.
+          echo "IMAGE=image-scan/${REPO,,}:${slug}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
           echo "REPORT=trivy-image-${slug}" >> "$GITHUB_ENV"
 
       - name: Checkout
@@ -131,7 +133,8 @@ jobs:
           trivy "${common[@]}" --format sarif --output "$RUNNER_TEMP/trivy-image.sarif"
           trivy "${common[@]}" --skip-db-update --format json --output "$RUNNER_TEMP/trivy-image.json"
           # Counts per severity for the job summary (report-only callers read it there).
-          python3 - "$RUNNER_TEMP/trivy-image.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          # -I: isolated mode, so modules in the checkout (json.py, collections.py) are never imported.
+          python3 -I - "$RUNNER_TEMP/trivy-image.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import collections, json, sys
           data = json.load(open(sys.argv[1]))
           counts = collections.Counter(v["Severity"] for r in data.get("Results") or [] for v in r.get("Vulnerabilities") or [])
