@@ -11,6 +11,7 @@ get no CI/CD.
 | [`security.yml`](.github/workflows/security.yml) | Gitleaks, Semgrep CE, OSV-Scanner, Trivy fs (vuln + IaC misconfig) |
 | [`deploy-railway.yml`](.github/workflows/deploy-railway.yml) | CD after CI passes on `main`: `mode: verify` (v1.3.0) waits for the deployment Railway makes itself and checks it, read-only; `mode: deploy` (v1.2.0) asks Railway to deploy that exact commit. Both smoke-test (health + commit) and fail loudly with a rollback command |
 | [`deploy-vercel.yml`](.github/workflows/deploy-vercel.yml) | The same for a Vercel project, through the REST API with `gitSource` at the commit SHA (no CLI, no upload). Not adopted yet: needs the owner's OK under D9 |
+| [`image-scan.yml`](.github/workflows/image-scan.yml) | Builds the Dockerfile, exports the image as a tarball and scans it with Trivy (OS and language packages inside the image). Public repos: hosted runner. Private repos: runner `["self-hosted","linux","x64","docker"]` (rootless podman on the homelab box). Opt-in (v1.6.0) |
 | [`design-floor.yml`](.github/workflows/design-floor.yml) | ADR-0007 design floor: builds the app, then runs the pinned checker (WCAG 2.2 AA floor, Thai typography, five widths) against its `design-floor.json`; report and screenshots as an artifact. Opt-in (v1.4.0; checker 1.1.0 since v1.5.0) |
 
 Everything runs as pinned binaries or pinned packages, without Docker, so the same workflows
@@ -22,6 +23,7 @@ run on GitHub-hosted runners and on the Railway self-hosted runner.
 |---|---|---|
 | Public | `'"ubuntu-24.04"'` (default) | `postgres: true` starts the VM's preinstalled server |
 | Private | `'["self-hosted","linux","x64","railway"]'` | `postgres: true` runs `start-postgres` (PostgreSQL 17 baked into the runner image) |
+| Private, image build/scan | `'["self-hosted","linux","x64","docker"]'` (only `image-scan.yml`) | — |
 
 The hosted image is pinned to `ubuntu-24.04` rather than `ubuntu-latest`, which GitHub moves to
 Ubuntu 26 from 2026-10-19; moving to a newer image is a deliberate change here, not a surprise.

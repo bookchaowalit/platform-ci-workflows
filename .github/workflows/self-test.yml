@@ -137,5 +137,12 @@ jobs:
     with:
       working-directory: tests/fixtures/design-floor
 
+  image-scan:
+    # Builds and scans a tiny fixture image on the GitHub-hosted runner.
+    uses: ./.github/workflows/image-scan.yml
+    with:
+      context: tests/fixtures/image
+      dockerfile: tests/fixtures/image/Dockerfile
+
   security:
     uses: ./.github/workflows/security.yml

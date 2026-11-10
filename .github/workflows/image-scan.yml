@@ -1,0 +1,139 @@
+# Reusable container image build + scan: build the repository's Dockerfile, export the image as a
+# tarball and scan it with Trivy (OS packages and language dependencies inside the image, which
+# Trivy fs in security.yml cannot see). Nothing is pushed anywhere.
+#
+# Where it runs:
+#   - Public repositories: the default GitHub-hosted runner (it has Docker).
+#   - Private repositories: runner '["self-hosted","linux","x64","docker"]'. Those runners live on the
+#     Fedora homelab box under the unprivileged user ci-docker with rootless podman
+#     (platform-ops-cli infra/ci-runner/local/run-docker.sh). The runner sets DOCKER_BUILDKIT=0, so
+#     `docker build` goes to podman's build API (buildah, which also understands RUN --mount). The
+#     normal `railway` runners have no container engine and cannot run this workflow.
+#
+# Caller example:
+#   image:
+#     uses: bookchaowalit/platform-ci-workflows/.github/workflows/image-scan.yml@<sha> # v1.6.0
+#     with:
+#       runner: '["self-hosted","linux","x64","docker"]'   # private repos only
+#       dockerfile: Dockerfile
+#
+# .trivyignore / .trivyignore.yaml in the repository root are honoured, as in security.yml.
+name: image-scan
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON runs-on value. '"ubuntu-24.04"' (default) for public repos, '["self-hosted","linux","x64","docker"]' for private.
+        type: string
+        default: '"ubuntu-24.04"'
+      context:
+        description: Build context directory.
+        type: string
+        default: "."
+      dockerfile:
+        description: Path of the Dockerfile, relative to the repository root.
+        type: string
+        default: "Dockerfile"
+      build-args:
+        description: Newline-separated KEY=value build arguments (public values only; never secrets).
+        type: string
+        default: ""
+      severity:
+        description: Severities that fail the job.
+        type: string
+        default: "HIGH,CRITICAL"
+      ignore-unfixed:
+        description: Skip vulnerabilities that have no fixed version yet.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  # Keep in step with security.yml.
+  # renovate: datasource=github-releases depName=aquasecurity/trivy
+  TRIVY_VERSION: "0.76.0"
+  TRIVY_SHA256: "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7"  # trivy_0.76.0_Linux-64bit.tar.gz
+
+jobs:
+  image:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Image name
+        env:
+          REPO: ${{ github.event.repository.name }}
+        # Docker image names must be lower case.
+        run: echo "IMAGE=image-scan/${REPO,,}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy ${{ env.TRIVY_VERSION }}
+        run: |
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"; cd "$RUNNER_TEMP"
+          f="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL -o "$f" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/$f"
+          echo "$TRIVY_SHA256  $f" | sha256sum -c -
+          tar -xzf "$f" -C "$bin" trivy
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Cache vulnerability DB
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: trivy-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: trivy-db-${{ runner.os }}-
+
+      - name: Build image
+        env:
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          args=(build --pull -f "$DOCKERFILE" -t "$IMAGE")
+          while IFS= read -r kv; do
+            [ -n "$kv" ] && args+=(--build-arg "$kv")
+          done <<<"$BUILD_ARGS"
+          # BuildKit on GitHub-hosted runners loads the result into the local image store by default
+          # (docker driver); DOCKER_BUILDKIT=0 on the homelab runner uses podman's build API.
+          docker "${args[@]}" "$CONTEXT"
+          docker save "$IMAGE" -o "$RUNNER_TEMP/image.tar"
+          ls -la "$RUNNER_TEMP/image.tar"
+
+      - name: Scan image
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+          SEVERITY: ${{ inputs.severity }}
+          IGNORE_UNFIXED: ${{ inputs.ignore-unfixed }}
+        run: |
+          common=(image --input "$RUNNER_TEMP/image.tar" --scanners vuln --severity "$SEVERITY")
+          if [ "$IGNORE_UNFIXED" = true ]; then common+=(--ignore-unfixed); fi
+          if [ -f .trivyignore.yaml ]; then common+=(--ignorefile .trivyignore.yaml); fi
+          trivy "${common[@]}" --format sarif --output "$RUNNER_TEMP/trivy-image.sarif"
+          trivy "${common[@]}" --skip-db-update --format table --exit-code 1
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trivy-image-sarif
+          path: ${{ runner.temp }}/trivy-image.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Clean up
+        # The homelab runner keeps its podman store between jobs: drop this image and dangling
+        # layers so the disk does not fill. Harmless on a fresh GitHub-hosted VM.
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/image.tar"
+          docker rmi -f "$IMAGE" >/dev/null 2>&1 || true
+          docker image prune -f >/dev/null 2>&1 || true
