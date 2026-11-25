@@ -2,8 +2,9 @@
 
 Copy of the ADR-0007 design floor checker, run by
 [`design-floor.yml`](../.github/workflows/design-floor.yml). The source of truth, its tests and
-its 77 fixtures live in `architecture-docs/design-floor/` (private); this copy exists because a
-public reusable workflow cannot check out a private repository.
+its 77 fixtures live in `platform-ops-cli/architecture/design-floor/` (moved from the private
+`architecture-docs/design-floor/` on 2026-11-25, SPEC-001); the commits below are from before the
+move. This copy was made because a public reusable workflow could not check out the private source.
 
 | File | From | SHA-256 |
 |---|---|---|
@@ -15,7 +16,7 @@ public reusable workflow cannot check out a private repository.
 
 Do not edit these files here. To update:
 
-1. Change and test the checker in `architecture-docs` (`npm test` in `design-floor/`).
+1. Change and test the checker in `platform-ops-cli` (`npm test` in `architecture/design-floor/`).
 2. Copy these files here unchanged, update this table, and commit that on its own.
 3. Set `FLOOR_REF` in `design-floor.yml` to that commit's SHA in a second commit, and release a
    new minor version.
