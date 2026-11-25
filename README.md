@@ -127,7 +127,7 @@ Suppress a finding only with a written reason, in the repository's own file:
 ## Design floor
 
 Opt-in for user-facing apps that adopted the floor (ADR-0007 in `architecture-docs`, adoption
-steps in `architecture-docs/design-floor/README.md`). The app keeps its `design-floor.json`; the
+steps in `platform-ops-cli/architecture/design-floor/README.md`). The app keeps its `design-floor.json`; the
 job installs, builds, and runs the checker vendored in [`design-floor/`](design-floor/SOURCE.md)
 at the commit pinned by `FLOOR_REF`.
 
@@ -151,7 +151,7 @@ at the commit pinned by `FLOOR_REF`.
 - v1.5.0 carries checker 1.1.0, whose rules are stricter than 1.0.3 (focus indicators compared
   with the resting state, off-viewport focus, focus cycles, short motion under reduced motion,
   inline Thai leading, link rows). An app that passed v1.4.x can fail on upgrade; the
-  `CHANGELOG.md` of `architecture-docs/design-floor/` lists each change.
+  `CHANGELOG.md` of `platform-ops-cli/architecture/design-floor/` lists each change.
 - Private repositories: the Railway runner image does not carry Chromium's libraries yet, so
   they keep the local report (ADR-0007 D-9) until it does; then pass the Railway `runner` and
   `install-browser-deps: false`.
