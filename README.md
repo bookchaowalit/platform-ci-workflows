@@ -113,7 +113,7 @@ lower it without a recorded exception.
 | Scanner | Fails when | Scope |
 |---|---|---|
 | Gitleaks | any secret | PR: the PR's commits. Push: the pushed range. Otherwise: full history. Merge-commit diffs included |
-| Semgrep CE (`p/default`) | PR: a finding the PR introduces (only new findings are reported). Full scans on `main`: every finding reported, not failing unless `semgrep-block-full-scan: true`. Parse errors/timeouts raise a warning. uv ignores the checkout's `uv.toml`, `pyproject.toml`, `.python-version` and `.venv` (v1.6.5) | whole checkout |
+| Semgrep CE (`p/default`) | PR: a finding the PR introduces (only new findings are reported). Full scans on `main`: every finding reported, not failing unless `semgrep-block-full-scan: true`. Parse errors/timeouts raise a warning. uv (setup and runs) ignores the checkout's `uv.toml`, `pyproject.toml`, `.python-version` and `.venv` (v1.6.6) | whole checkout |
 | OSV-Scanner | any known vulnerability, or a lockfile it could not parse | every lockfile / manifest |
 | Trivy fs | fixable `HIGH`/`CRITICAL` vuln or misconfiguration. The vulnerability DB is downloaded in its own step (3 tries; skipped when `vuln` is off; one cache entry per DB build), so a slow cold download on a shared runner host cannot time out the scan, which gets `--timeout 10m` (v1.6.4) | whole checkout, minus `node_modules` and `.venv` |
 
