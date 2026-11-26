@@ -265,13 +265,14 @@ jobs:
 
       # Restore and save are split so the saved key names the DB snapshot actually downloaded:
       # a run after a mid-day DB update saves a new entry instead of keeping a stale one. The save
-      # runs last, after the scan and report upload, so it never eats into the scan's time and it
-      # also keeps the Java index DB that the scan downloads when it finds JARs.
+      # runs last, after the scan and report upload, so it never eats into the scan's time.
       - name: Restore vulnerability DB
         if: contains(inputs.trivy-scanners, 'vuln')
+        id: restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/trivy-cache
+          # Only the vulnerability DB; the Java index DB (fetched when a scan finds JARs) is not cached.
+          path: ${{ runner.temp }}/trivy-cache/db
           # Own prefix: image-scan.yml keeps a different cache under trivy-db-*.
           key: trivy-fs-db-${{ runner.os }}-
           restore-keys: trivy-fs-db-${{ runner.os }}-
@@ -291,10 +292,12 @@ jobs:
             echo "::warning::Trivy DB download attempt $attempt failed"; sleep $((attempt * 15))
           done
           [ -n "$ok" ] || { echo "::error::Trivy DB download failed after 3 attempts"; exit 1; }
-          # The snapshot's UpdatedAt names the cache entry (one per DB build, ~every 6 h).
-          updated=$(sed -nE 's/.*"UpdatedAt":"([^"]+)".*/\1/p' "$TRIVY_CACHE_DIR/db/metadata.json" | tr -c 'A-Za-z0-9\n' '-')
-          [ -n "$updated" ] || { echo "::error::no UpdatedAt in the Trivy DB metadata"; exit 1; }
-          echo "key=trivy-fs-db-${RUNNER_OS}-${updated}" >> "$GITHUB_OUTPUT"
+          # UpdatedAt + DownloadedAt name the entry: a new DB build, or a re-download that refreshes
+          # DownloadedAt (so the next run skips it), each saves a new entry; restore-keys picks the newest.
+          meta="$TRIVY_CACHE_DIR/db/metadata.json"
+          stamp=$(sed -nE 's/.*"UpdatedAt":"([^"]+)".*"DownloadedAt":"([^"]+)".*/\1_\2/p' "$meta" | tr -c 'A-Za-z0-9_\n' '-')
+          [ -n "$stamp" ] || { echo "::error::no UpdatedAt/DownloadedAt in $meta"; exit 1; }
+          echo "key=trivy-fs-db-${RUNNER_OS}-${stamp}" >> "$GITHUB_OUTPUT"
 
       - name: Scan filesystem
         env:
@@ -320,10 +323,11 @@ jobs:
           retention-days: 14
 
       - name: Save vulnerability DB
-        if: always() && steps.db.outputs.key != ''
+        # Skip when nothing was downloaded (the restored entry already holds this exact DB).
+        if: always() && steps.db.outputs.key != '' && steps.db.outputs.key != steps.restore.outputs.cache-matched-key
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         # An entry for this snapshot may already exist (another run saved it first).
         continue-on-error: true
         with:
-          path: ${{ runner.temp }}/trivy-cache
+          path: ${{ runner.temp }}/trivy-cache/db
           key: ${{ steps.db.outputs.key }}
