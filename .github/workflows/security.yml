@@ -241,9 +241,10 @@ jobs:
   trivy-fs:
     if: inputs.trivy
     runs-on: ${{ fromJSON(inputs.runner) }}
-    # The cold DB download (~140 MB) can take >10 min when many repositories share one runner
-    # host's uplink; the scan itself then gets its own --timeout.
-    timeout-minutes: 30
+    # Budget: DB download up to 3 x 12 min + backoff, then two scans of up to 10 min each
+    # (SARIF + table) = under 60. A cold download can take >10 min when many repositories share
+    # one runner host's uplink; normally the whole job takes 1-3 min.
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -262,31 +263,44 @@ jobs:
           tar -xzf "$f" -C "$bin" trivy
           echo "$bin" >> "$GITHUB_PATH"
 
-      - name: Cache key (one DB snapshot per day)
-        id: dbkey
-        run: echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache vulnerability DB
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restore and save are split so the saved key names the DB snapshot actually downloaded:
+      # a run after a mid-day DB update saves a new entry instead of keeping a stale one.
+      - name: Restore vulnerability DB
+        if: contains(inputs.trivy-scanners, 'vuln')
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/trivy-cache
-          # A daily key saves one ~140 MB entry per day instead of one per run; restore-keys
-          # falls back to the newest earlier day, which Trivy then updates in place.
-          key: trivy-db-${{ runner.os }}-${{ steps.dbkey.outputs.day }}
+          key: trivy-db-${{ runner.os }}-
           restore-keys: trivy-db-${{ runner.os }}-
 
       - name: Download vulnerability DB
+        if: contains(inputs.trivy-scanners, 'vuln')
+        id: db
         env:
           # Trivy's default --db-repository already falls back from mirror.gcr.io to ghcr.io.
           TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
         run: |
           # Separate step so the download never eats into the scan's --timeout. Retries cover
-          # transient registry errors; a fresh cached DB makes this a no-op.
+          # transient registry errors; a fresh restored DB makes this a no-op.
+          ok=""
           for attempt in 1 2 3; do
-            if trivy fs --download-db-only --no-progress --timeout 20m; then exit 0; fi
-            echo "::warning::Trivy DB download attempt $attempt failed"; sleep $((attempt * 20))
+            if trivy fs --download-db-only --no-progress --timeout 12m; then ok=1; break; fi
+            echo "::warning::Trivy DB download attempt $attempt failed"; sleep $((attempt * 15))
           done
-          echo "::error::Trivy DB download failed after 3 attempts"; exit 1
+          [ -n "$ok" ] || { echo "::error::Trivy DB download failed after 3 attempts"; exit 1; }
+          # The snapshot's UpdatedAt names the cache entry (one per DB build, ~every 6 h).
+          updated=$(sed -nE 's/.*"UpdatedAt":"([^"]+)".*/\1/p' "$TRIVY_CACHE_DIR/db/metadata.json" | tr -c 'A-Za-z0-9\n' '-')
+          [ -n "$updated" ] || { echo "::error::no UpdatedAt in the Trivy DB metadata"; exit 1; }
+          echo "key=trivy-db-${RUNNER_OS}-${updated}" >> "$GITHUB_OUTPUT"
+
+      - name: Save vulnerability DB
+        if: contains(inputs.trivy-scanners, 'vuln')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # An entry for this snapshot may already exist (another run saved it first).
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: ${{ steps.db.outputs.key }}
 
       - name: Scan filesystem
         env:
