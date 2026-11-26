@@ -241,7 +241,9 @@ jobs:
   trivy-fs:
     if: inputs.trivy
     runs-on: ${{ fromJSON(inputs.runner) }}
-    timeout-minutes: 15
+    # The cold DB download (~140 MB) can take >10 min when many repositories share one runner
+    # host's uplink; the scan itself then gets its own --timeout.
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
@@ -260,12 +262,31 @@ jobs:
           tar -xzf "$f" -C "$bin" trivy
           echo "$bin" >> "$GITHUB_PATH"
 
+      - name: Cache key (one DB snapshot per day)
+        id: dbkey
+        run: echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
       - name: Cache vulnerability DB
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/trivy-cache
-          key: trivy-db-${{ runner.os }}-${{ github.run_id }}
+          # A daily key saves one ~140 MB entry per day instead of one per run; restore-keys
+          # falls back to the newest earlier day, which Trivy then updates in place.
+          key: trivy-db-${{ runner.os }}-${{ steps.dbkey.outputs.day }}
           restore-keys: trivy-db-${{ runner.os }}-
+
+      - name: Download vulnerability DB
+        env:
+          # Trivy's default --db-repository already falls back from mirror.gcr.io to ghcr.io.
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        run: |
+          # Separate step so the download never eats into the scan's --timeout. Retries cover
+          # transient registry errors; a fresh cached DB makes this a no-op.
+          for attempt in 1 2 3; do
+            if trivy fs --download-db-only --no-progress --timeout 20m; then exit 0; fi
+            echo "::warning::Trivy DB download attempt $attempt failed"; sleep $((attempt * 20))
+          done
+          echo "::error::Trivy DB download failed after 3 attempts"; exit 1
 
       - name: Scan filesystem
         env:
@@ -273,12 +294,13 @@ jobs:
           SEVERITY: ${{ inputs.trivy-severity }}
           SCANNERS: ${{ inputs.trivy-scanners }}
         run: |
-          common=(fs --scanners "$SCANNERS" --severity "$SEVERITY" --ignore-unfixed --skip-dirs node_modules --skip-dirs .venv)
+          # The DB is already downloaded (previous step), so neither run touches the network for it.
+          common=(fs --skip-db-update --timeout 10m --scanners "$SCANNERS" --severity "$SEVERITY" --ignore-unfixed --skip-dirs node_modules --skip-dirs .venv)
           # .trivyignore is read by default; the YAML form (with paths and statements) must be named.
           if [ -f .trivyignore.yaml ]; then common+=(--ignorefile .trivyignore.yaml); fi
           common+=(.)
           trivy "${common[@]}" --format sarif --output "$RUNNER_TEMP/trivy.sarif"
-          trivy "${common[@]}" --skip-db-update --format table --exit-code 1
+          trivy "${common[@]}" --format table --exit-code 1
 
       - name: Upload report
         if: always()

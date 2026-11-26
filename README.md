@@ -115,7 +115,7 @@ lower it without a recorded exception.
 | Gitleaks | any secret | PR: the PR's commits. Push: the pushed range. Otherwise: full history. Merge-commit diffs included |
 | Semgrep CE (`p/default`) | PR: a finding the PR introduces (only new findings are reported). Full scans on `main`: every finding reported, not failing unless `semgrep-block-full-scan: true`. Parse errors/timeouts raise a warning | whole checkout |
 | OSV-Scanner | any known vulnerability, or a lockfile it could not parse | every lockfile / manifest |
-| Trivy fs | fixable `HIGH`/`CRITICAL` vuln or misconfiguration | whole checkout, minus `node_modules` and `.venv` |
+| Trivy fs | fixable `HIGH`/`CRITICAL` vuln or misconfiguration. The vulnerability DB is downloaded in its own step (3 tries, one cache entry per day), so a slow cold download on a shared runner host cannot time out the scan, which gets `--timeout 10m` (v1.6.4) | whole checkout, minus `node_modules` and `.venv` |
 
 Every scanner uploads its SARIF report as a workflow artifact (14 days). Code-scanning upload is
 not used, because private repositories on the free plan cannot receive it.
