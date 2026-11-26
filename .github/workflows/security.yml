@@ -166,12 +166,17 @@ jobs:
           elif [ "$BLOCK_FULL" = true ]; then
             args+=(--error)
           fi
+          # Semgrep runs inside the checkout (baseline diff, .semgrepignore); uv must not trust it.
+          # --no-config ignores a uv.toml / pyproject.toml there; the uv-managed 3.13 ignores its
+          # .python-version. `uv run` also executes a checkout .venv/bin/python just to inspect it
+          # (even with --managed-python), so the report count below runs from $RUNNER_TEMP.
+          uvflags=(--no-config --managed-python --python 3.13)
           set +e
-          uvx "semgrep@$SEMGREP_VERSION" "${args[@]}" .
+          uvx "${uvflags[@]}" "semgrep@$SEMGREP_VERSION" "${args[@]}" .
           code=$?
           set -e
           # -I: isolated mode, so a json.py in the checkout cannot be imported here.
-          read -r count errors < <(uv run --no-project python -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["results"]), len(d["errors"]))' "$RUNNER_TEMP/semgrep.json" 2>/dev/null || echo "? ?")
+          read -r count errors < <(cd "$RUNNER_TEMP" && uv run "${uvflags[@]}" --no-project python -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["results"]), len(d["errors"]))' "$RUNNER_TEMP/semgrep.json" 2>/dev/null || echo "? ?")
           echo "### Semgrep: $count finding(s) reported, $errors analysis error(s) (exit $code)" >> "$GITHUB_STEP_SUMMARY"
           if [ "$errors" != 0 ]; then
             # Parse errors / timeouts mean some code was not analysed. Not fatal (unrelated files such
