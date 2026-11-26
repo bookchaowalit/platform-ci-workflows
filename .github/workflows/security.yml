@@ -264,14 +264,17 @@ jobs:
           echo "$bin" >> "$GITHUB_PATH"
 
       # Restore and save are split so the saved key names the DB snapshot actually downloaded:
-      # a run after a mid-day DB update saves a new entry instead of keeping a stale one.
+      # a run after a mid-day DB update saves a new entry instead of keeping a stale one. The save
+      # runs last, after the scan and report upload, so it never eats into the scan's time and it
+      # also keeps the Java index DB that the scan downloads when it finds JARs.
       - name: Restore vulnerability DB
         if: contains(inputs.trivy-scanners, 'vuln')
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/trivy-cache
-          key: trivy-db-${{ runner.os }}-
-          restore-keys: trivy-db-${{ runner.os }}-
+          # Own prefix: image-scan.yml keeps a different cache under trivy-db-*.
+          key: trivy-fs-db-${{ runner.os }}-
+          restore-keys: trivy-fs-db-${{ runner.os }}-
 
       - name: Download vulnerability DB
         if: contains(inputs.trivy-scanners, 'vuln')
@@ -291,16 +294,7 @@ jobs:
           # The snapshot's UpdatedAt names the cache entry (one per DB build, ~every 6 h).
           updated=$(sed -nE 's/.*"UpdatedAt":"([^"]+)".*/\1/p' "$TRIVY_CACHE_DIR/db/metadata.json" | tr -c 'A-Za-z0-9\n' '-')
           [ -n "$updated" ] || { echo "::error::no UpdatedAt in the Trivy DB metadata"; exit 1; }
-          echo "key=trivy-db-${RUNNER_OS}-${updated}" >> "$GITHUB_OUTPUT"
-
-      - name: Save vulnerability DB
-        if: contains(inputs.trivy-scanners, 'vuln')
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        # An entry for this snapshot may already exist (another run saved it first).
-        continue-on-error: true
-        with:
-          path: ${{ runner.temp }}/trivy-cache
-          key: ${{ steps.db.outputs.key }}
+          echo "key=trivy-fs-db-${RUNNER_OS}-${updated}" >> "$GITHUB_OUTPUT"
 
       - name: Scan filesystem
         env:
@@ -324,3 +318,12 @@ jobs:
           path: ${{ runner.temp }}/trivy.sarif
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Save vulnerability DB
+        if: always() && steps.db.outputs.key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # An entry for this snapshot may already exist (another run saved it first).
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: ${{ steps.db.outputs.key }}
