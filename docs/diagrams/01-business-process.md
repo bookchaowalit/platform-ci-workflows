@@ -19,14 +19,18 @@ flowchart TD
   SEC --> RES
   IMG --> RES
   FLOOR --> RES
+  RES --> TRIG["Railway branch trigger + Wait for CI (verify mode): Railway deploys main itself when CI is green; vars.CD_DEPLOY does not stop it"]
   RES --> GREEN{"CI jobs green on main AND vars.CD_DEPLOY == true?"}
-  GREEN -->|no| STOP["no deploy"]
+  GREEN -->|no| STOP["no deploy job (no check by this repo; Railway trigger in verify mode still deploys)"]
   GREEN -->|yes| DEP{"deploy job"}
   DEP --> RAIL["deploy-railway.yml: verify (wait for Railway's own deploy) or deploy (serviceInstanceDeployV2 at SHA)"]
-  DEP --> VER["deploy-vercel.yml: REST gitSource at SHA"]
-  RAIL --> SMOKE["smoke test: health-url 2xx + commit field = SHA"]
-  VER --> SMOKE
-  SMOKE -->|fail| RB["::error + rollback command for last good deployment"]
+  TRIG -.->|"deployment that verify mode finds"| RAIL
+  DEP -.->|"ready, not adopted: no caller yet, owner OK under D9 (G1)"| VER["deploy-vercel.yml: REST gitSource at SHA"]
+  RAIL --> WAIT["wait for the deployment record: SUCCESS / READY and its commit = SHA"]
+  VER --> WAIT
+  WAIT -->|ok| SMOKE["smoke test: health-url 2xx; only with commit-url: commit-field = SHA"]
+  WAIT -->|"FAILED / ERROR / timeout / wrong commit"| RB
+  SMOKE -->|fail| RB["::error + job summary; rollback command when a last good deployment was recorded"]
   SELF["self-test.yml on this repo: actionlint, fixtures, gates_test.py, deploy_test.py, checker typecheck"] --> TAG["semver tag v1.x.y (v1 moves)"]
   TAG -->|"Renovate bumps SHA in callers"| CALLER
 ```
@@ -37,6 +41,9 @@ Sources: `.github/workflows/ci-node.yml`, `.github/workflows/ci-python.yml`, `.g
 
 - ทุก workflow รับ input `runner` (JSON `runs-on`): public ใช้ `ubuntu-24.04`, private ใช้ label self-hosted; README ยังเขียนถึง runner บน Railway ส่วน `PRODUCT.md` เขียนว่า "self-hosted runner pool" ว่า pool ไหนรับงาน private อยู่จริงวันนี้ [ต้องยืนยัน]
 - `image-scan.yml` บน private ใช้ label `["self-hosted","linux","x64","docker"]` (rootless podman บนเครื่อง homelab ตาม README) [ต้องยืนยัน] สถานะเครื่อง
+- `vars.CD_DEPLOY` เปิด/ปิดแค่ job deploy ใน CI ของ caller; ใน `mode: verify` ผู้ deploy คือ branch trigger ของ Railway ("Wait for CI") เอง การปิด `CD_DEPLOY` จึงปิดแค่การตรวจ ไม่ได้หยุด production deploy (`README.md` §Deploy (CD), ตาราง Two modes)
+- commit ถูกตรวจทุก run จาก deployment record (Railway `meta.commitHash`, Vercel `meta.githubCommitSha`); การถาม endpoint ของแอปที่รันอยู่ทำเฉพาะเมื่อ caller ส่ง `commit-url` (`deploy-railway.yml` steps Wait / Smoke test, `deploy-vercel.yml` เช่นกัน)
+- step `Rollback hint` รันเมื่อ job ล้มเหลวที่ step ไหนก็ได้หลัง Check the commit (รวม deploy `FAILED`/`ERROR`/timeout ก่อนถึง smoke test) และให้คำสั่ง rollback เฉพาะเมื่อพบ deployment ก่อนหน้าที่ดี ไม่พบก็บอกให้ไปดู dashboard
 - deploy workflow ไม่เก็บ secret เอง: caller ส่ง `RAILWAY_TOKEN` / Vercel token ผ่าน `secrets:`
 - release ล่าสุดที่เห็นใน tag: `v1.6.6`
 
