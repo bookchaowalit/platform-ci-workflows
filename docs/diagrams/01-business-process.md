@@ -59,12 +59,12 @@ Sources: `.github/workflows/ci-node.yml`, `.github/workflows/ci-python.yml`, `.g
 
 | ID | As-Is → To-Be | Status | Owner | Evidence |
 |---|---|---|---|---|
-| G1 | `deploy-vercel.yml` มีแล้วแต่ยังไม่มี caller ใช้ → owner อนุมัติใช้ภายใต้ D9 | decide | owner | `README.md` workflow table (deploy-vercel row) |
+| G1 | `deploy-vercel.yml` มีแล้วแต่ยังไม่มี caller ใช้ → owner อนุมัติใช้ภายใต้ D9; owner ตัดสิน 2026-11-28: อนุมัติให้ใช้ เป็นตัว gate deploy หลัง CI ผ่านของ web-starter (G2 ที่นั่น) | todo | claude | `README.md` workflow table (deploy-vercel row) |
 | G2 | runner ของ private repo ไม่มี Docker: `services:` containers, Testcontainers, ZAP ยังไม่รองรับ → เฟสถัดไป | todo | owner | `README.md` §Where jobs run; ADR-0003 ใน architecture-docs |
 | G3 | design floor ของ private repo ยังรันแบบ local report (runner image ไม่มี library ของ Chromium) → รันใน CI ด้วย runner self-hosted และ `install-browser-deps: false` | todo | claude | `README.md` §Design floor (Private repositories) |
 | G4 | ยังไม่รู้ว่า callers ทุกตัวอยู่บน release ล่าสุดหรือไม่ จาก repo นี้ → callers อยู่บน release ล่าสุดของแต่ละ workflow | doing | claude | `PRODUCT.md` §Measures (R4 adoption report ครอบคลุมเฉพาะ job design-floor) |
 | G5 | README ยังอธิบาย runner บน Railway ขณะที่ `PRODUCT.md` พูดถึง self-hosted pool → เอกสารตรงกับ runner ที่ใช้จริง | todo | claude | `README.md` §Where jobs run; `PRODUCT.md` §Positioning |
-| G6 | ไม่มี To-Be ของกระบวนการ (เช่น adoption report ครบทุก workflow, เกณฑ์ปล่อย v2) → owner กำหนด | decide | owner | ไม่มีใน `PRODUCT.md` / `README.md` |
+| G6 | ไม่มี To-Be ของกระบวนการ (เช่น adoption report ครบทุก workflow, เกณฑ์ปล่อย v2) → owner กำหนด; owner ตัดสิน 2026-11-28: claude ร่าง To-Be (รายงานว่าแต่ละ workflow มี caller กี่ repo, เกณฑ์ออก v2) แล้ว owner อนุมัติ | todo | claude | ไม่มีใน `PRODUCT.md` / `README.md` |
 
 ## Open questions
 
