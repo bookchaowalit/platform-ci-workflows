@@ -51,7 +51,7 @@ Sources: `.github/workflows/ci-node.yml`, `.github/workflows/ci-python.yml`, `.g
 
 - `PRODUCT.md` §Measures: `self-test.yml` เขียวบน `main` เสมอ; callers อยู่บน release ล่าสุดของแต่ละ workflow ที่ใช้
 - `PRODUCT.md` §Product Purpose: release ใหม่ต้องไม่ทำ caller พังเงียบ ๆ
-- `README.md`: `deploy-vercel.yml` "Not adopted yet: needs the owner's OK under D9"; `services:` containers, Testcontainers และ ZAP บน runner ที่ไม่มี Docker "deferred to a later phase"; design floor ของ private repo รอให้ runner image มี library ของ Chromium
+- `README.md`: `deploy-vercel.yml` "Approved by the owner 2026-11-28 for web-starter; not adopted yet"; `services:` containers, Testcontainers และ ZAP บน runner ที่ไม่มี Docker "deferred to a later phase"; design floor ของ private repo รอให้ runner image มี library ของ Chromium
 
 ไม่มี To-Be diagram ของกระบวนการทั้งหมดที่เขียนไว้ เป้าข้างบนเป็นรายการ ไม่ใช่ flow ใหม่
 
@@ -59,12 +59,15 @@ Sources: `.github/workflows/ci-node.yml`, `.github/workflows/ci-python.yml`, `.g
 
 | ID | As-Is → To-Be | Status | Owner | Evidence |
 |---|---|---|---|---|
-| G1 | `deploy-vercel.yml` มีแล้วแต่ยังไม่มี caller ใช้ → owner อนุมัติใช้ภายใต้ D9; owner ตัดสิน 2026-11-28: อนุมัติให้ใช้ เป็นตัว gate deploy หลัง CI ผ่านของ web-starter (G2 ที่นั่น) | todo | claude | `README.md` workflow table (deploy-vercel row) |
+| G1 | `deploy-vercel.yml` มีแล้วแต่ยังไม่มี caller ใช้ → owner อนุมัติใช้ภายใต้ D9; owner ตัดสิน 2026-11-28: อนุมัติให้ใช้ เป็นตัว gate deploy หลัง CI ผ่านของ web-starter (G2 ที่นั่น); ก่อนใช้ต้องปิด Vercel Git auto-deploy ของ `main` (`git.deploymentEnabled.main: false` ใน `vercel.json`) ไม่งั้น push เข้า `main` ยัง deploy ก่อน CI ผ่านและอาจ deploy ซ้ำ (ตาม `deploy-vercel.yml:7-8`) | todo | claude | `README.md` workflow table (deploy-vercel row) |
 | G2 | runner ของ private repo ไม่มี Docker: `services:` containers, Testcontainers, ZAP ยังไม่รองรับ → เฟสถัดไป | todo | owner | `README.md` §Where jobs run; ADR-0003 ใน architecture-docs |
 | G3 | design floor ของ private repo ยังรันแบบ local report (runner image ไม่มี library ของ Chromium) → รันใน CI ด้วย runner self-hosted และ `install-browser-deps: false` | todo | claude | `README.md` §Design floor (Private repositories) |
 | G4 | ยังไม่รู้ว่า callers ทุกตัวอยู่บน release ล่าสุดหรือไม่ จาก repo นี้ → callers อยู่บน release ล่าสุดของแต่ละ workflow | doing | claude | `PRODUCT.md` §Measures (R4 adoption report ครอบคลุมเฉพาะ job design-floor) |
 | G5 | README ยังอธิบาย runner บน Railway ขณะที่ `PRODUCT.md` พูดถึง self-hosted pool → เอกสารตรงกับ runner ที่ใช้จริง | todo | claude | `README.md` §Where jobs run; `PRODUCT.md` §Positioning |
 | G6 | ไม่มี To-Be ของกระบวนการ (เช่น adoption report ครบทุก workflow, เกณฑ์ปล่อย v2) → owner กำหนด; owner ตัดสิน 2026-11-28: claude ร่าง To-Be (รายงานว่าแต่ละ workflow มี caller กี่ repo, เกณฑ์ออก v2) แล้ว owner อนุมัติ | todo | claude | ไม่มีใน `PRODUCT.md` / `README.md` |
+| G7 | ทาง `no` ใน As-Is รวม CI ไม่ผ่าน, รันนอก `main` และ `CD_DEPLOY` ไม่เป็น `true` ไว้ด้วยกัน แต่ผลต่างกัน (เปิด Wait for CI แล้ว CI ไม่ผ่าน Railway ไม่ deploy) → แยกกรณีเมื่อแก้ diagram (Codex review 2026-11-28, จดไว้แทนการวาดใหม่ตามที่ owner สั่ง) | todo | claude | `.github/workflows/deploy-railway.yml` |
+| G8 | As-Is บอกว่าตรวจ deployment record "ทุก run" แต่ถ้า branch tip เปลี่ยนแล้ว ทั้ง Railway และ Vercel จบด้วย `skipped` โดยไม่ตรวจหรือ smoke → เขียนให้ตรง (Codex review 2026-11-28, จดไว้แทนการวาดใหม่ตามที่ owner สั่ง) | todo | claude | `.github/workflows/deploy-railway.yml`; `.github/workflows/deploy-vercel.yml` |
+| G9 | smoke test ใช้ `curl -fsS` จึงรับ redirect (302) ได้ถ้าไม่ตั้ง `health-expect` และ `commit-url` รับ SHA prefix 7 ตัว (P3) → อธิบายตามจริง (Codex review 2026-11-28, จดไว้แทนการวาดใหม่ตามที่ owner สั่ง) | todo | claude | `.github/workflows/deploy-*.yml` |
 
 ## Open questions
 
